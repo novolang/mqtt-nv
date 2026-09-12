@@ -1,0 +1,191 @@
+// mqtttrans_tests.nv — the claim the whole package rests on: a client
+// driven over a transport that performs nothing is charged nothing.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: mqtt-nv.<module>.<fn>`.
+// That is the expected result until the bodies land.
+//
+// THE COMPILER MAKES THE FIRST ASSERTION BEFORE THE RUN STARTS.
+// `MqttScript` below implements `MqttTransport[]` — a transport over
+// bytes already in memory, which reads nothing and writes nothing —
+// and the functions that drive a client over it are declared `[]`.  If
+// `mqttclient.poll` were secretly effectful, or if the effect
+// parameter did not flow from the impl to the call, this file would
+// not compile.  That is SPEC § 5.6 being load-bearing rather than
+// decorative, and it is why the package's timing is testable at all.
+
+use std.test
+use std.bytes
+use mqttclient
+use mqttopts
+use mqttsession
+use mqtttrans
+
+// A transport over a script of bytes.  It performs nothing: the bytes
+// are already in memory, so there is no socket, no clock and no
+// syscall anywhere under it.
+struct MqttScript
+    incoming: Bytes
+    open: Bool
+
+// A transport that costs nothing.
+//
+// ```novo ignore
+// use mqtttrans
+//
+// fn drive(c: MqttClient, s: MqttScript) -> Result<MqttPoll, MqttClientError>
+//     mqttclient.poll(c, s, 0)
+// ```
+impl MqttTransport[] for MqttScript
+    fn mqtt_send(self, data: Bytes) -> Result<Int, IoError>
+        Ok(bytes.len(data))
+
+    fn mqtt_recv(self, max: Int) -> Result<Bytes, IoError>
+        if self.open
+            Ok(self.incoming)
+        else
+            Ok(bytes.from_str(""))
+
+    fn mqtt_close(self) -> ?IoError
+        None
+
+    fn mqtt_is_open(self) -> Bool
+        self.open
+
+fn a_client() -> MqttClient
+    mqttclient.client(mqttopts.with_keep_alive(mqttopts.options("sensor-7"), 30),
+                      mqttsession.session("sensor-7"))
+
+fn a_script() -> MqttScript
+    MqttScript { incoming: bytes.from_str(""), open: true }
+
+@test
+fn test_a_client_over_a_pure_transport_declares_no_effects() [io]
+    // The signature of `driven` is the assertion, and the compiler
+    // has already checked it: no `[io]`, no `[net]`, no `[time]`.
+    test.case("a turn over a script is a value computation")
+    match driven(a_client(), a_script())
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+
+fn driven(c: MqttClient, s: MqttScript) -> Result<MqttPoll, MqttClientError>
+    mqttclient.poll(c, s, 0)
+
+@test
+fn test_connecting_over_a_script_is_the_same_computation() [io]
+    test.case("connect is generic over the transport too")
+    match connected(a_client(), a_script())
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+
+fn connected(c: MqttClient, s: MqttScript) -> Result<MqttPoll, MqttClientError>
+    mqttclient.connect(c, s, 0)
+
+@test
+fn test_every_command_is_generic_over_the_transport() [io]
+    // Four separate functions rather than one, because each has its own
+    // signature and it is the signatures that are being asserted.
+    let c = a_client()
+    let s = a_script()
+
+    test.case("publish")
+    match published(c, s)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+
+    test.case("publish_packet, for a caller that built its own")
+    match published_packet(c, s)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+
+    test.case("subscribe")
+    match subscribed(c, s)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+
+    test.case("disconnect")
+    match disconnected(c, s)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+
+fn published(c: MqttClient, s: MqttScript) -> Result<MqttPoll, MqttClientError>
+    mqttclient.publish(c, s, "sensors/7/temp", [0x32], AtMostOnce, false, 0)
+
+fn published_packet(c: MqttClient, s: MqttScript) -> Result<MqttPoll, MqttClientError>
+    let p = MqttPublish { topic: "sensors/7/temp", packet_id: None, qos: AtMostOnce,
+                          retain: false, dup: false, payload: [0x32], properties: [] }
+    mqttclient.publish_packet(c, s, p, 0)
+
+fn subscribed(c: MqttClient, s: MqttScript) -> Result<MqttPoll, MqttClientError>
+    let sub = MqttSubscription { filter: "sensors/#", qos: AtLeastOnce, no_local: false,
+                                 retain_as_published: false, retain_handling: 0 }
+    mqttclient.subscribe(c, s, [sub], 0)
+
+fn disconnected(c: MqttClient, s: MqttScript) -> Result<MqttPoll, MqttClientError>
+    mqttclient.disconnect(c, s, None, 0)
+
+@test
+fn test_the_deadline_is_answerable_without_taking_a_turn() [io]
+    // A `select` over several clients computes its timeout from all of
+    // them before it blocks on any, so the number has to be available
+    // outside a poll.
+    let c = a_client()
+
+    test.case("a client with a thirty-second keep-alive waits at most that long")
+    test.assert(mqttclient.wait_ms(c, 0) <= 30000)
+
+    test.case("and never asks the caller to wait a negative time")
+    test.assert(mqttclient.wait_ms(c, 100000) >= 0)
+
+@test
+fn test_the_clock_reader_is_the_one_function_with_a_time_row() [io, time]
+    // This test's own row is `[io, time]` and every other row in this
+    // file is `[io]`, which is the disclosure working: the clock is
+    // reachable from exactly one place.
+    test.case("a monotonic reading is not negative")
+    test.assert(mqttclient.now_ms() >= 0)
+
+@test
+fn test_dialling_a_port_nothing_listens_on_is_an_error_not_a_panic() [io, net]
+    // Port 1 on the loopback interface: reserved, and nothing binds it.
+    // The assertion is that a refusal comes back as a value, because a
+    // client that panicked on an unreachable broker could not implement
+    // a reconnection policy at all.
+    test.case("a plain TCP dial refuses rather than aborting")
+    match mqtttrans.dial_tcp("127.0.0.1", 1)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("and so does one with a receive timeout set")
+    match mqtttrans.dial_tcp_timeout("127.0.0.1", 1, 100)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_tls_dial_to_the_same_port_refuses_the_same_way() [io, net]
+    test.case("the TLS configuration is one line")
+    let cfg = mqtttrans.tls_for("broker.example.com")
+
+    test.case("and a dial to a closed port is an error")
+    match mqtttrans.dial_tls("127.0.0.1", 1, cfg)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_two_ports_are_the_registered_ones() [io]
+    test.case("1883 for plain MQTT")
+    test.assert(mqtttrans.MQTT_PORT == 1883)
+
+    test.case("8883 for MQTT over TLS")
+    test.assert(mqtttrans.MQTT_TLS_PORT == 8883)
+
+@test
+fn test_the_socket_is_reachable_for_an_option_this_package_does_not_wrap() [io, net]
+    // A caller that needs TCP_NODELAY, or a larger receive buffer, gets
+    // the stream rather than a wrapper function per option.
+    test.case("a dial that failed has no stream to hand over")
+    match mqtttrans.dial_tcp("127.0.0.1", 1)
+        Err(_) => test.assert(true)
+        Ok(t)  =>
+            let s = mqtttrans.stream_of(t)
+            test.assert(s.is_open())

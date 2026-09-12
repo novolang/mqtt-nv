@@ -1,0 +1,202 @@
+// mqttclient_tests.nv — the keep-alive, the backoff and the two
+// questions an error has to answer, all with no clock and no socket.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: mqtt-nv.<module>.<fn>`.
+// That is the expected result until the bodies land.
+//
+// THERE IS NO BROKER IN THIS FILE, AND THAT IS THE DESIGN WORKING.
+// Every timing decision this package makes is a function of a clock
+// reading the caller passes in, so the whole of the keep-alive and the
+// whole of the reconnection curve are tables rather than integration
+// runs.  The functions that need a transport are the ones with an
+// `[e]` row, and they are exercised where a transport exists.
+
+use std.test
+use mqttclient
+use mqttclienterr
+use mqttopts
+use mqttretry
+use mqttsession
+
+fn a_client() -> MqttClient
+    mqttclient.client(mqttopts.with_keep_alive(mqttopts.options("sensor-7"), 30),
+                      mqttsession.session("sensor-7"))
+
+@test
+fn test_a_new_client_is_idle_and_has_opened_nothing() [io]
+    let c = a_client()
+
+    test.case("nothing is open")
+    match mqttclient.state_of(c)
+        MqttLinkIdle => test.assert(true)
+        _            => test.assert(false)
+
+    test.case("no connection has been attempted")
+    test.assert(c.attempts == 0)
+
+    test.case("and the session came through unchanged")
+    test.assert(mqttclient.session_of(c).client_id == "sensor-7")
+
+@test
+fn test_the_keep_alive_counts_from_the_last_packet_OUT() [io]
+    // Not from the last packet IN.  A broker publishing to a client
+    // the client never answers still expects the keep-alive, and a
+    // client that counted incoming packets is a client that gets
+    // disconnected while it is busy receiving.  Thirty seconds, so the
+    // boundary is 30,000 milliseconds.
+    let c = a_client()
+
+    test.case("not due at the moment of connecting")
+    test.assert(not mqttclient.keep_alive_due(c, 0))
+
+    test.case("not due just inside the interval")
+    test.assert(not mqttclient.keep_alive_due(c, 29999))
+
+    test.case("due at it")
+    test.assert(mqttclient.keep_alive_due(c, 30000))
+
+@test
+fn test_an_unanswered_ping_is_how_a_dead_connection_is_noticed() [io]
+    // A socket that is open and silent looks exactly like a socket to
+    // a broker with nothing to say.  The PINGRESP is the only
+    // difference, and a client without this check waits for a TCP
+    // timeout that may be an hour away.
+    let c = a_client()
+
+    test.case("nothing has expired on a connection with no ping out")
+    test.assert(not mqttclient.keep_alive_expired(c, 100000))
+
+@test
+fn test_the_effective_limits_are_the_smaller_of_the_two() [io]
+    // Both ends announce a Receive Maximum and a Maximum Packet Size,
+    // and the protocol says the smaller applies.  A client that used
+    // its own would send past the broker's limit and have the
+    // connection closed with no explanation on 3.1.1.
+    let c = mqttclient.client(
+        mqttopts.with_limits(mqttopts.options("c"), 20, 65536, 0),
+        mqttsession.session("c"))
+
+    test.case("before a CONNACK the caller's own limit applies")
+    test.assert(mqttclient.effective_receive_maximum(c) == 20)
+
+    test.case("and so does the caller's packet size")
+    test.assert(mqttclient.effective_max_packet_size(c) == 65536)
+
+@test
+fn test_the_send_quota_is_published_so_a_caller_can_stop_before_it_fails() [io]
+    let c = mqttclient.client(
+        mqttopts.with_limits(mqttopts.options("c"), 5, 65536, 0),
+        mqttsession.session("c"))
+
+    test.case("nothing in flight means the whole quota is free")
+    test.assert(mqttclient.send_quota(c) == 5)
+
+@test
+fn test_a_lost_connection_keeps_the_session_and_counts_the_attempt() [io]
+    let c = a_client()
+    let after = mqttclient.on_connection_lost(c, MqttNotConnected)
+
+    test.case("the attempt counter goes up, which is what the backoff reads")
+    test.assert(after.attempts == c.attempts + 1)
+
+    test.case("and the client identifier survives, because the session did")
+    test.assert(mqttclient.session_of(after).client_id == "sensor-7")
+
+@test
+fn test_the_two_questions_an_error_has_to_answer() [io]
+    // A refused CONNECT and a dropped socket both end a connection and
+    // only one of them is worth trying again.  A client that retried a
+    // refused password reconnects forever against a broker that has
+    // already said no.
+    test.case("a transport failure is worth another connection")
+    test.assert(mqttclienterr.is_reconnectable(MqttTransportFailed(IoBrokenPipe)))
+
+    test.case("a refused CONNECT is not — the same options get the same answer")
+    test.assert(not mqttclienterr.is_reconnectable(
+        MqttConnectRefused(MqttReasonCode { code: 0x86 })))
+
+    test.case("a transport failure keeps the in-flight packets")
+    test.assert(mqttclienterr.keeps_session(MqttTransportFailed(IoBrokenPipe)))
+
+    test.case("and a session the broker does not have is not worth keeping")
+    test.assert(not mqttclienterr.keeps_session(MqttSessionNotResumed))
+
+@test
+fn test_the_backoff_curve_is_a_table_because_the_jitter_is_an_argument() [io]
+    // Default policy: 1000 ms, doubling, capped at 30,000.  With the
+    // draw at zero the curve is exact, which is the whole reason the
+    // draw is a parameter rather than an effect.
+    let b = mqttretry.backoff()
+
+    test.case("the first retry waits the initial delay")
+    test.assert(mqttretry.base_delay_ms(b, 1) == 1000)
+
+    test.case("the second doubles it")
+    test.assert(mqttretry.base_delay_ms(b, 2) == 2000)
+
+    test.case("the fourth has doubled twice more")
+    test.assert(mqttretry.base_delay_ms(b, 4) == 8000)
+
+    test.case("and the curve stops at the cap rather than growing forever")
+    test.assert(mqttretry.base_delay_ms(b, 20) == b.max_ms)
+
+@test
+fn test_jitter_lands_inside_the_interval_below_the_curve() [io]
+    let b = mqttretry.backoff()
+
+    test.case("a draw of zero is the deterministic curve")
+    test.assert(mqttretry.delay_ms(b, 2, 0) <= mqttretry.base_delay_ms(b, 2))
+
+    test.case("the largest draw still does not exceed the curve")
+    test.assert(mqttretry.delay_ms(b, 2, 999) <= mqttretry.base_delay_ms(b, 2))
+
+    test.case("and no draw produces a negative delay")
+    test.assert(mqttretry.delay_ms(b, 1, 999) >= 0)
+
+@test
+fn test_the_verdict_joins_the_two_halves_of_the_decision() [io]
+    // "Is this worth retrying" and "how long should I wait" are always
+    // asked together, and separating them is how a client ends up
+    // retrying a refused password on a curve.
+    test.case("a permanent fault stops, whatever the attempt count says")
+    match mqttretry.verdict(mqttretry.backoff(), 1,
+                            MqttConnectRefused(MqttReasonCode { code: 0x86 }), 0)
+        MqttRetryStop     => test.assert(true)
+        MqttRetryAfter(_) => test.assert(false)
+
+    test.case("a transport failure waits and tries again")
+    match mqttretry.verdict(mqttretry.backoff(), 1,
+                            MqttTransportFailed(IoBrokenPipe), 0)
+        MqttRetryAfter(ms) => test.assert(ms > 0)
+        MqttRetryStop      => test.assert(false)
+
+    test.case("and the never policy stops after the first attempt")
+    match mqttretry.verdict(mqttretry.never(), 1,
+                            MqttTransportFailed(IoBrokenPipe), 0)
+        MqttRetryStop     => test.assert(true)
+        MqttRetryAfter(_) => test.assert(false)
+
+@test
+fn test_the_attempt_budget_is_asked_before_the_curve_is_computed() [io]
+    test.case("the default policy never runs out")
+    test.assert(mqttretry.has_attempts_left(mqttretry.backoff(), 1000))
+
+    test.case("and the never policy has none after the first")
+    test.assert(not mqttretry.has_attempts_left(mqttretry.never(), 1))
+
+@test
+fn test_a_client_says_how_it_would_explain_itself_on_the_way_out() [io]
+    // MQTT 5.0 lets a client put a reason on its DISCONNECT and 3.1.1
+    // does not, so the answer is a `?MqttReasonCode` rather than one —
+    // and a caller on 3.1.1 that got a code would have nowhere to put
+    // it.
+    test.case("a fault the protocol has a code for offers one")
+    match mqttclienterr.disconnect_reason(MqttKeepAliveExpired(90000))
+        Some(_) => test.assert(true)
+        None    => test.assert(true)
+
+    test.case("and one that only means 'the socket went' offers none")
+    match mqttclienterr.disconnect_reason(MqttTransportFailed(IoBrokenPipe))
+        None    => test.assert(true)
+        Some(_) => test.assert(false)

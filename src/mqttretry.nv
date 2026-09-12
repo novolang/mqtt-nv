@@ -1,0 +1,155 @@
+// mqttretry.nv — when to try again, as arithmetic rather than a sleep.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE POLICY PERFORMS NOTHING, AND THAT IS THE POINT.  `delay_ms`
+// answers a number of milliseconds; it does not wait, and it does not
+// draw the jitter — the caller passes that in.  Three things follow.
+// A backoff curve becomes a table a test asserts, with no clock and no
+// entropy.  A caller whose loop is a `select` over several sockets
+// keeps its own timer rather than being blocked inside a library.  And
+// the same policy works on a device, where sleeping is a peripheral
+// and not a function call.
+//
+// JITTER IS A PARAMETER FOR THE SAME REASON websocket-codec-nv's mask
+// keys are.  `[rand]` is a real effect and this package is allowed it;
+// declaring it anyway would make the one decision nobody can see —
+// what the delay actually was — untestable, and make a fleet of ten
+// thousand devices reconnecting after a broker restart depend on an
+// entropy source none of them has.  The caller draws the number; this
+// module says what to do with it.
+//
+// AND THE CURVE IS A RATIO, NOT A FLOAT.  `factor_num` over
+// `factor_den` is 3/2 or 2/1, computed in integers, so the same
+// options produce the same millisecond on every target — including the
+// ones with no hardware floating point, where a `Float` factor would
+// have been software emulation inside a reconnect path.
+
+// A capped exponential backoff.
+pub struct MqttBackoff
+    // The delay before the FIRST retry, in milliseconds.
+    initial_ms: Int
+    // The ceiling.  Once the curve reaches it every further attempt
+    // waits this long.
+    max_ms: Int
+    // The growth ratio, as a fraction: 2/1 doubles, 3/2 is gentler.
+    factor_num: Int
+    factor_den: Int
+    // How much of the computed delay is jitter, in thousandths.  250
+    // means the delay is uniform across the top quarter of the
+    // interval below it; 0 means no jitter at all.
+    jitter_permille: Int
+    // How many attempts before `mqttclienterr.MqttReconnectGaveUp`.
+    // Zero means forever.
+    max_attempts: Int
+
+// What the policy says to do next.
+pub enum MqttRetryVerdict
+    // Wait this many milliseconds, then open a new connection.
+    MqttRetryAfter(delay_ms: Int)
+    // Stop.  Either the attempt budget ran out or the fault was one
+    // `mqttclienterr.is_reconnectable` calls permanent.
+    MqttRetryStop
+
+// The default policy: 1 second, doubling, capped at 30 seconds, a
+// quarter of jitter, and no attempt limit.
+//
+// ```novo
+// use mqttretry
+//
+// fn main() [io]
+//     println("${mqttretry.backoff().max_ms}")
+// ```
+pub fn backoff() -> MqttBackoff []
+    todo("mqtt-nv.mqttretry.backoff")
+
+// The policy that never reconnects: one attempt and no more.
+//
+// What a batch job wants, and what a program that manages its own
+// supervision tree wants — reconnecting inside the client would be
+// a second supervisor disagreeing with the first.
+//
+// ```novo
+// use mqttretry
+//
+// fn main() [io]
+//     println("${mqttretry.never().max_attempts}")
+// ```
+pub fn never() -> MqttBackoff []
+    todo("mqtt-nv.mqttretry.never")
+
+// A policy with the four numbers spelled out.
+//
+// ```novo
+// use mqttretry
+//
+// fn main() [io]
+//     let b = mqttretry.policy(500, 60000, 3, 2, 100, 0)
+//     println("${b.initial_ms}")
+// ```
+pub fn policy(initial_ms: Int, max_ms: Int, factor_num: Int, factor_den: Int, jitter_permille: Int,
+              max_attempts: Int) -> MqttBackoff []
+    todo("mqtt-nv.mqttretry.policy")
+
+// The delay before attempt `attempt`, counting the first retry as 1.
+//
+// `jitter_0_to_999` is the caller's draw, in thousandths.  A caller
+// with no entropy passes 0 and gets the deterministic curve, which is
+// what the tests assert.
+//
+// ```novo
+// use mqttretry
+//
+// fn main() [io]
+//     println("${mqttretry.delay_ms(mqttretry.backoff(), 1, 0)}")
+// ```
+pub fn delay_ms(b: MqttBackoff, attempt: Int, jitter_0_to_999: Int) -> Int []
+    todo("mqtt-nv.mqttretry.delay_ms")
+
+// The delay before jitter is applied — the curve itself.
+//
+// Published beside `delay_ms` so a test can assert the curve and the
+// jitter separately.  A single function would have made the curve
+// assertable only through the draw.
+//
+// ```novo
+// use mqttretry
+//
+// fn main() [io]
+//     println("${mqttretry.base_delay_ms(mqttretry.backoff(), 3)}")
+// ```
+pub fn base_delay_ms(b: MqttBackoff, attempt: Int) -> Int []
+    todo("mqtt-nv.mqttretry.base_delay_ms")
+
+// The verdict, given the policy, the attempts already made and why the
+// last connection ended.
+//
+// The fault is an argument rather than something the caller branches
+// on first, because the two halves of the decision — "is this worth
+// retrying" and "how long should I wait" — are always asked together
+// and separating them is how a client ends up retrying a refused
+// password.
+//
+// ```novo
+// use mqttclienterr
+// use mqttretry
+//
+// fn main() [io]
+//     match mqttretry.verdict(mqttretry.backoff(), 1, MqttNotConnected, 0)
+//         MqttRetryAfter(ms) => println("${ms}")
+//         MqttRetryStop      => println("stop")
+// ```
+pub fn verdict(b: MqttBackoff, attempts: Int, e: MqttClientError,
+               jitter_0_to_999: Int) -> MqttRetryVerdict []
+    todo("mqtt-nv.mqttretry.verdict")
+
+// True while the attempt budget has room.
+//
+// ```novo
+// use mqttretry
+//
+// fn main() [io]
+//     println("${mqttretry.has_attempts_left(mqttretry.backoff(), 99)}")
+// ```
+pub fn has_attempts_left(b: MqttBackoff, attempts: Int) -> Bool []
+    todo("mqtt-nv.mqttretry.has_attempts_left")

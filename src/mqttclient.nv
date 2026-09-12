@@ -1,0 +1,490 @@
+// mqttclient.nv — the client value, and the seven functions a host
+// calls from its own loop.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THE LOOP BELONGS TO THE CALLER.  There is no `run()` in this
+// package, no thread, no channel and no callback.  A host holds an
+// `MqttClient`, reads its clock once per turn, calls `poll`, and acts
+// on the events it gets back.  That is the shape rumqttc settled on
+// after starting somewhere else, and the reason is that any program
+// worth writing an MQTT client into already has a loop — an HTTP
+// server's accept loop, a device's duty cycle, a supervisor's select —
+// and a library with its own loop has to be bridged into that one,
+// badly, by every caller.
+//
+// THE CLOCK IS AN ARGUMENT.  Every function that cares about time
+// takes `now_ms`, a monotonic millisecond reading the host obtained.
+// `now_ms()` below is the one function in the package that reads a
+// clock, and it exists so a caller does not have to know that
+// `Mono.now().us() / 1000` is the spelling.  Three things follow.  The
+// keep-alive, the resend schedule and the backoff curve are all
+// assertable against a table with no clock in the room.  A caller
+// driving twenty brokers reads its clock once rather than twenty
+// times.  And the same functions work at `@tier(rt)`, where there is
+// no `std.time` and the reading comes from a board's timer.
+//
+// WHAT A TURN DOES, in order, because the order is the protocol:
+//
+//   1. resend anything `mqttsession.due_for_resend` names
+//   2. send the PINGREQ if `keep_alive_due` says so
+//   3. fail the connection if `keep_alive_expired` says so
+//   4. read what the transport has, feed mqtt-codec-nv, drain it
+//   5. answer what must be answered — PUBACK, PUBREC, PUBREL, PUBCOMP
+//   6. return the events and the next deadline
+//
+// Steps 1 to 3 come before the read because a transport read can
+// block, and a keep-alive that is checked only after a read that never
+// returns is a keep-alive that never fires.
+
+// Where a client is with respect to a broker.
+pub enum MqttLinkState
+    // No transport, or one that has been closed.
+    MqttLinkIdle
+    // The CONNECT is on the wire and the CONNACK has not arrived.
+    MqttLinkAwaitingConnAck
+    // The CONNACK arrived and said yes.
+    MqttLinkUp
+    // A DISCONNECT has been sent and the socket is being closed.
+    MqttLinkClosing
+    // The connection ended and `mqttretry` has not yet been consulted.
+    MqttLinkDown
+
+// Everything one connection needs, and a session that outlives it.
+pub struct MqttClient
+    opts: MqttOptions
+    link: MqttLinkState
+    // The codec's reader, carrying whatever arrived and did not yet
+    // make a whole packet.
+    reader: MqttReader
+    // The state that survives this socket.
+    session: MqttSession
+    // The broker's own limits, from the CONNACK.  Zero until it
+    // arrives.  The effective limit is the smaller of this and the
+    // caller's, which is why both are kept rather than one being
+    // overwritten.
+    broker_receive_maximum: Int
+    broker_max_packet_size: Int
+    broker_topic_alias_maximum: Int
+    // The keep-alive the broker imposed, if it sent a Server Keep
+    // Alive property; otherwise the caller's.
+    keep_alive_ms: Int
+    // Clock readings, in the host's milliseconds.
+    last_sent_ms: Int
+    last_received_ms: Int
+    ping_sent_ms: Int
+    // Whether a PINGREQ is outstanding.
+    ping_pending: Bool
+    // How many connections have been attempted since the last
+    // successful CONNACK.  `mqttretry.verdict` reads it.
+    attempts: Int
+
+// What a turn of the loop taught the caller.
+pub enum MqttClientEvent
+    // The CONNACK arrived and said yes.  The packet carries the
+    // session-present flag and the broker's own limits, both of which
+    // the client has already applied — it is here so a caller can log
+    // it and so `MqttSessionNotResumed` is reproducible.
+    MqttConnAckReceived(ack: MqttConnAck)
+    // A message arrived, with its topic already resolved against the
+    // alias table.  This is the event the program exists for.
+    MqttMessageArrived(msg: MqttPublish)
+    // A QoS 1 or 2 publication completed: the PUBACK or the PUBCOMP
+    // arrived, and the exchange is out of the session.
+    MqttPublishAcknowledged(packet_id: Int)
+    // A SUBACK arrived.  The reason codes are per filter, in the order
+    // they were sent, and a granted QoS BELOW the one asked for is a
+    // success — which is the case a client that only checked for
+    // failure reports as working and then never receives anything.
+    MqttSubAckReceived(packet_id: Int, reasons: [MqttReasonCode])
+    // An UNSUBACK arrived.
+    MqttUnsubAckReceived(packet_id: Int, reasons: [MqttReasonCode])
+    // A PINGRESP arrived, this long after the PINGREQ went out.
+    MqttPingAnswered(round_trip_ms: Int)
+    // A packet went out again because its acknowledgement had not
+    // arrived within `resend_after_ms`.
+    MqttPacketResent(packet_id: Int, resends: Int)
+    // The broker sent a DISCONNECT, and this connection is over.
+    MqttDisconnectReceived(reason: MqttReasonCode)
+
+// One turn of the caller's loop.
+pub struct MqttPoll
+    // The client after the turn.  Every function in this module is
+    // value-in, value-out; nothing is mutated behind the caller.
+    client: MqttClient
+    // What happened, in the order it happened.
+    events: [MqttClientEvent]
+    // How long the caller may wait before calling `poll` again, in
+    // milliseconds from the `now_ms` it passed in.  The keep-alive
+    // deadline, the next resend, or the CONNACK timeout — whichever
+    // is soonest.  Zero means call again immediately; there is more
+    // decoded and undrained.
+    wait_ms: Int
+
+// A client over a set of options and a session.
+//
+// Nothing is opened.  The session is the caller's — fresh from
+// `mqttsession.session` on a first run, or read back from wherever it
+// was stored on a later one — and passing the stored session is what
+// makes a QoS 1 publication survive a restart.
+//
+// ```novo
+// use mqttclient
+// use mqttopts
+// use mqttsession
+//
+// fn main() [io]
+//     let c = mqttclient.client(mqttopts.options("sensor-7"),
+//                               mqttsession.session("sensor-7"))
+//     println("${c.attempts}")
+// ```
+pub fn client(o: MqttOptions, s: MqttSession) -> MqttClient []
+    todo("mqtt-nv.mqttclient.client")
+
+// Where the client is with respect to a broker.
+//
+// ```novo
+// use mqttclient
+// use mqttopts
+// use mqttsession
+//
+// fn main() [io]
+//     let c = mqttclient.client(mqttopts.options("c"), mqttsession.session("c"))
+//     match mqttclient.state_of(c)
+//         MqttLinkIdle => println("idle")
+//         _            => println("busy")
+// ```
+pub fn state_of(c: MqttClient) -> MqttLinkState []
+    todo("mqtt-nv.mqttclient.state_of")
+
+// The session, for a caller about to store it.
+//
+// Worth storing after every turn that produced an event, and cheap:
+// the session is a value and taking it copies nothing the caller did
+// not already hold.
+//
+// ```novo
+// use mqttclient
+// use mqttopts
+// use mqttsession
+//
+// fn main() [io]
+//     let c = mqttclient.client(mqttopts.options("c"), mqttsession.session("c"))
+//     println(mqttclient.session_of(c).client_id)
+// ```
+pub fn session_of(c: MqttClient) -> MqttSession []
+    todo("mqtt-nv.mqttclient.session_of")
+
+// How many more QoS 1 or 2 publications may be in flight before the
+// broker's Receive Maximum is reached.
+//
+// Zero means `publish` at QoS 1 or 2 will answer
+// `MqttSendQuotaExceeded`.  Published so a caller with a queue of its
+// own can stop pulling from it rather than discovering the limit as an
+// error.
+//
+// ```novo
+// use mqttclient
+// use mqttopts
+// use mqttsession
+//
+// fn main() [io]
+//     let c = mqttclient.client(mqttopts.options("c"), mqttsession.session("c"))
+//     println("${mqttclient.send_quota(c)}")
+// ```
+pub fn send_quota(c: MqttClient) -> Int []
+    todo("mqtt-nv.mqttclient.send_quota")
+
+// A monotonic millisecond reading.
+//
+// The one function in this package that reads a clock, and the only
+// `[time]` row in it.  Everything else takes the reading as an
+// argument.  A caller with its own clock — a device, a simulation, a
+// test — never calls this and pays nothing for its existence.
+//
+// ```novo
+// use mqttclient
+//
+// fn main() [io, time]
+//     let t = mqttclient.now_ms()
+//     println("${t >= 0}")
+// ```
+pub fn now_ms() -> Int [time]
+    todo("mqtt-nv.mqttclient.now_ms")
+
+// Send the CONNECT and wait for the CONNACK.
+//
+// Effect-polymorphic: it costs whatever the transport costs —
+// `[io, net]` over `MqttTcp`, `[net]` over `MqttTls`, nothing at all
+// over a buffer in a test.
+//
+// The CONNACK is waited for rather than left to `poll` because until
+// it arrives the client may send nothing else, so a caller that had to
+// poll for it would have to write the "not yet" branch of every other
+// call.  `connack_timeout_ms` bounds the wait.
+//
+// ```novo ignore
+// use mqttclient
+// use mqtttrans
+//
+// fn open(c: MqttClient, t: MqttTcp) -> Result<MqttPoll, MqttClientError> [io, net, time]
+//     mqttclient.connect(c, t, mqttclient.now_ms())
+// ```
+pub fn connect<T: MqttTransport[e]>(c: MqttClient, t: T,
+                                    now_ms: Int) -> Result<MqttPoll, MqttClientError> [e]
+    todo("mqtt-nv.mqttclient.connect")
+
+// One turn: resend what is due, ping if the keep-alive says so, read
+// what the transport has, answer what must be answered.
+//
+// The function the loop calls.  It returns as soon as the transport
+// has nothing more to give rather than waiting for a packet, so a
+// caller that has other work does it between turns; `wait_ms` is how
+// long it may take before coming back.
+//
+// ```novo ignore
+// use mqttclient
+// use mqtttrans
+//
+// fn turn(c: MqttClient, t: MqttTcp) -> Result<MqttPoll, MqttClientError> [io, net, time]
+//     mqttclient.poll(c, t, mqttclient.now_ms())
+// ```
+pub fn poll<T: MqttTransport[e]>(c: MqttClient, t: T,
+                                 now_ms: Int) -> Result<MqttPoll, MqttClientError> [e]
+    todo("mqtt-nv.mqttclient.poll")
+
+// Publish a message.
+//
+// At QoS 0 the packet goes out and the exchange is over.  At QoS 1 and
+// 2 it is recorded in the session first, so a crash between the write
+// and the acknowledgement resends rather than loses — which is the
+// whole difference between QoS 0 and QoS 1, and it is a store ordering
+// rather than a protocol feature.
+//
+// ```novo ignore
+// use mqttclient
+// use mqtttrans
+//
+// fn say(c: MqttClient, t: MqttTcp, b: [u8]) -> Result<MqttPoll, MqttClientError> [io, net, time]
+//     mqttclient.publish(c, t, "sensors/7/temp", b, AtLeastOnce, false,
+//                        mqttclient.now_ms())
+// ```
+pub fn publish<T: MqttTransport[e]>(c: MqttClient, t: T, topic: Str, payload: [u8], qos: MqttQos,
+                                    retain: Bool,
+                                    now_ms: Int) -> Result<MqttPoll, MqttClientError> [e]
+    todo("mqtt-nv.mqttclient.publish")
+
+// Publish a message mqtt-codec-nv already built, for a caller that
+// needs a property section this package's `publish` does not take.
+//
+// The escape hatch that keeps `publish` short.  Everything 5.0 can put
+// on a PUBLISH — a response topic, correlation data, a content type, a
+// message expiry — is a field on `MqttPublish`, and a `publish` with a
+// parameter for each would have been unreadable for the ninety-nine
+// cases that want none of them.
+//
+// ```novo ignore
+// use mqttclient
+// use mqtttrans
+//
+// fn say(c: MqttClient, t: MqttTcp, p: MqttPublish) -> Result<MqttPoll, MqttClientError> [io, net, time]
+//     mqttclient.publish_packet(c, t, p, mqttclient.now_ms())
+// ```
+pub fn publish_packet<T: MqttTransport[e]>(c: MqttClient, t: T, p: MqttPublish,
+                                           now_ms: Int) -> Result<MqttPoll, MqttClientError> [e]
+    todo("mqtt-nv.mqttclient.publish_packet")
+
+// Subscribe to one or more filters.
+//
+// A list rather than one filter per call, because MQTT's SUBSCRIBE
+// carries a list and a client that sent one packet per filter turns a
+// reconnection's resubscribe into as many round trips as it has
+// subscriptions.
+//
+// ```novo ignore
+// use mqttclient
+// use mqtttrans
+//
+// fn listen(c: MqttClient, t: MqttTcp, subs: [MqttSubscription]) -> Result<MqttPoll, MqttClientError> [io, net, time]
+//     mqttclient.subscribe(c, t, subs, mqttclient.now_ms())
+// ```
+pub fn subscribe<T: MqttTransport[e]>(c: MqttClient, t: T, subs: [MqttSubscription],
+                                      now_ms: Int) -> Result<MqttPoll, MqttClientError> [e]
+    todo("mqtt-nv.mqttclient.subscribe")
+
+// Unsubscribe from one or more filters.
+//
+// ```novo ignore
+// use mqttclient
+// use mqtttrans
+//
+// fn stop(c: MqttClient, t: MqttTcp, f: [Str]) -> Result<MqttPoll, MqttClientError> [io, net, time]
+//     mqttclient.unsubscribe(c, t, f, mqttclient.now_ms())
+// ```
+pub fn unsubscribe<T: MqttTransport[e]>(c: MqttClient, t: T, filters: [Str],
+                                        now_ms: Int) -> Result<MqttPoll, MqttClientError> [e]
+    todo("mqtt-nv.mqttclient.unsubscribe")
+
+// Send a PINGREQ now, whatever the keep-alive schedule says.
+//
+// For a caller that has its own idea of when a connection is suspect —
+// a laptop coming back from sleep, a device whose radio just
+// reassociated — and wants to find out before the keep-alive interval
+// would have asked.
+//
+// ```novo ignore
+// use mqttclient
+// use mqtttrans
+//
+// fn probe(c: MqttClient, t: MqttTcp) -> Result<MqttPoll, MqttClientError> [io, net, time]
+//     mqttclient.ping(c, t, mqttclient.now_ms())
+// ```
+pub fn ping<T: MqttTransport[e]>(c: MqttClient, t: T,
+                                 now_ms: Int) -> Result<MqttPoll, MqttClientError> [e]
+    todo("mqtt-nv.mqttclient.ping")
+
+// Send a DISCONNECT and close the transport.
+//
+// A clean disconnection is what tells the broker NOT to publish the
+// will, which is the one observable difference between this and
+// dropping the socket — and the reason a program with a will has to
+// call it on the way out.
+//
+// ```novo ignore
+// use mqttclient
+// use mqtttrans
+//
+// fn bye(c: MqttClient, t: MqttTcp) -> Result<MqttPoll, MqttClientError> [io, net, time]
+//     mqttclient.disconnect(c, t, None, mqttclient.now_ms())
+// ```
+pub fn disconnect<T: MqttTransport[e]>(c: MqttClient, t: T, reason: ?MqttReasonCode,
+                                       now_ms: Int) -> Result<MqttPoll, MqttClientError> [e]
+    todo("mqtt-nv.mqttclient.disconnect")
+
+// Send the packets a resumed session owes, in order.
+//
+// Called after `connect` on a connection whose CONNACK reported the
+// session present.  Separate from `connect` because a caller that has
+// been away for a day may want to look at what it is about to resend
+// before it resends it — `mqttsession.outgoing_of` is how — and a
+// `connect` that resent unconditionally would give them no chance.
+//
+// ```novo ignore
+// use mqttclient
+// use mqtttrans
+//
+// fn resume(c: MqttClient, t: MqttTcp) -> Result<MqttPoll, MqttClientError> [io, net, time]
+//     mqttclient.resume(c, t, mqttclient.now_ms())
+// ```
+pub fn resume<T: MqttTransport[e]>(c: MqttClient, t: T,
+                                   now_ms: Int) -> Result<MqttPoll, MqttClientError> [e]
+    todo("mqtt-nv.mqttclient.resume")
+
+// The client after a connection ended, ready for a new transport.
+//
+// The session is kept or cleared by `mqttclienterr.keeps_session`, the
+// per-connection alias tables are dropped, and the attempt counter
+// goes up.  A caller that built a fresh client instead would lose the
+// in-flight publications the session exists to keep.
+//
+// ```novo
+// use mqttclient
+// use mqttclienterr
+// use mqttopts
+// use mqttsession
+//
+// fn main() [io]
+//     let c = mqttclient.client(mqttopts.options("c"), mqttsession.session("c"))
+//     let d = mqttclient.on_connection_lost(c, MqttNotConnected)
+//     println("${d.attempts}")
+// ```
+pub fn on_connection_lost(c: MqttClient, e: MqttClientError) -> MqttClient []
+    todo("mqtt-nv.mqttclient.on_connection_lost")
+
+// How long the caller may wait before calling `poll` again.
+//
+// The same number `MqttPoll.wait_ms` carries, for a caller that wants
+// it without taking a turn — a `select` over several clients computes
+// its timeout from all of them before it blocks on any.
+//
+// ```novo
+// use mqttclient
+// use mqttopts
+// use mqttsession
+//
+// fn main() [io]
+//     let c = mqttclient.client(mqttopts.options("c"), mqttsession.session("c"))
+//     println("${mqttclient.wait_ms(c, 0)}")
+// ```
+pub fn wait_ms(c: MqttClient, now_ms: Int) -> Int []
+    todo("mqtt-nv.mqttclient.wait_ms")
+
+// True when a PINGREQ is owed at this reading.
+//
+// Owed means: more than the keep-alive interval has passed since the
+// last packet went OUT.  Not since one came in — a broker that is
+// publishing to a client the client never hears from still expects the
+// keep-alive, and a client that counted incoming packets is a client
+// that gets disconnected while it is busy receiving.
+//
+// ```novo
+// use mqttclient
+// use mqttopts
+// use mqttsession
+//
+// fn main() [io]
+//     let c = mqttclient.client(mqttopts.options("c"), mqttsession.session("c"))
+//     println("${mqttclient.keep_alive_due(c, 0)}")
+// ```
+pub fn keep_alive_due(c: MqttClient, now_ms: Int) -> Bool []
+    todo("mqtt-nv.mqttclient.keep_alive_due")
+
+// True when a PINGREQ has gone unanswered longer than
+// `ping_timeout_ms`, which means the connection is dead.
+//
+// The check a TCP read timeout cannot make: a socket that is open and
+// silent looks exactly like a socket to a broker with nothing to say.
+//
+// ```novo
+// use mqttclient
+// use mqttopts
+// use mqttsession
+//
+// fn main() [io]
+//     let c = mqttclient.client(mqttopts.options("c"), mqttsession.session("c"))
+//     println("${mqttclient.keep_alive_expired(c, 0)}")
+// ```
+pub fn keep_alive_expired(c: MqttClient, now_ms: Int) -> Bool []
+    todo("mqtt-nv.mqttclient.keep_alive_expired")
+
+// The effective Receive Maximum: the smaller of what this client asked
+// for and what the broker granted.
+//
+// ```novo
+// use mqttclient
+// use mqttopts
+// use mqttsession
+//
+// fn main() [io]
+//     let c = mqttclient.client(mqttopts.options("c"), mqttsession.session("c"))
+//     println("${mqttclient.effective_receive_maximum(c)}")
+// ```
+pub fn effective_receive_maximum(c: MqttClient) -> Int []
+    todo("mqtt-nv.mqttclient.effective_receive_maximum")
+
+// The effective Maximum Packet Size: the smaller of the two.
+//
+// What `MqttPacketTooLargeForBroker` is measured against, and the
+// number a caller chunking a large payload needs before it chunks.
+//
+// ```novo
+// use mqttclient
+// use mqttopts
+// use mqttsession
+//
+// fn main() [io]
+//     let c = mqttclient.client(mqttopts.options("c"), mqttsession.session("c"))
+//     println("${mqttclient.effective_max_packet_size(c)}")
+// ```
+pub fn effective_max_packet_size(c: MqttClient) -> Int []
+    todo("mqtt-nv.mqttclient.effective_max_packet_size")

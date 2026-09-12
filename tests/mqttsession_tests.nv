@@ -1,0 +1,212 @@
+// mqttsession_tests.nv — the state that survives a socket, and the
+// four ways a client loses a message by getting it slightly wrong.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: mqtt-nv.<module>.<fn>`.
+// That is the expected result until the bodies land.
+//
+// EVERY CASE HERE IS A DELIVERY GUARANTEE.  QoS 1 and QoS 2 are not
+// features of the wire format — the packets are trivial — they are
+// properties of what a client remembers across a reconnection.  So the
+// assertions are about memory: what is kept, what is replaced, what is
+// reused and what must never be.
+
+use std.test
+use std.list
+use mqttsession
+
+@test
+fn test_a_fresh_session_remembers_nothing_and_says_so() [io]
+    let s = mqttsession.session("sensor-7")
+
+    test.case("the identifier is the one thing it starts with")
+    test.assert(s.client_id == "sensor-7")
+
+    test.case("a broker has not reported it present")
+    test.assert(not mqttsession.is_present(s))
+
+    test.case("nothing is in flight")
+    test.assert(mqttsession.inflight_count(s) == 0)
+
+    test.case("and nothing is owed on the way back")
+    test.assert(list.len(mqttsession.resume_packets(s)) == 0)
+
+@test
+fn test_packet_identifiers_come_from_the_session_and_are_never_zero() [io]
+    // An exchange survives a reconnection, so a counter that restarted
+    // with the connection would hand out an identifier still in
+    // flight — and the broker would acknowledge the wrong message.
+    let s = mqttsession.session("c")
+
+    match mqttsession.take_packet_id(s)
+        Err(_) => test.assert(false)
+        Ok(a)  =>
+            test.case("the first identifier is 1, never 0")
+            test.assert(a.packet_id == 1)
+
+            test.case("the session that comes back has handed it out")
+            match mqttsession.take_packet_id(a.session)
+                Err(_) => test.assert(false)
+                Ok(b)  => test.assert(b.packet_id != a.packet_id)
+
+@test
+fn test_a_qos2_exchange_changes_shape_half_way_through() [io]
+    // The half a client written from the diagram forgets: after a
+    // PUBREC the PUBLISH must never go out again and the PUBREL must.
+    // So the stored bytes are REPLACED, not flagged.
+    let f = MqttInflight { packet_id: 9, awaiting: Publish, qos: ExactlyOnce,
+                           packet: [0x3C, 0x02], first_sent_ms: 0, resends: 0 }
+    let s = mqttsession.record_outgoing(mqttsession.session("c"), f)
+
+    test.case("the publication is in flight")
+    test.assert(mqttsession.inflight_count(s) == 1)
+
+    let after = mqttsession.advance_to_pubrel(s, 9, [0x62, 0x02, 0x00, 0x09])
+
+    test.case("it is still in flight — a PUBCOMP is still owed")
+    test.assert(mqttsession.inflight_count(after) == 1)
+
+    test.case("and what goes out on a resume is now the PUBREL")
+    let out = mqttsession.resume_packets(after)
+    test.assert(list.len(out) == 1)
+
+@test
+fn test_an_acknowledgement_ends_the_exchange() [io]
+    let f = MqttInflight { packet_id: 4, awaiting: Publish, qos: AtLeastOnce,
+                           packet: [0x32, 0x02], first_sent_ms: 0, resends: 0 }
+    let s = mqttsession.record_outgoing(mqttsession.session("c"), f)
+
+    test.case("in flight before the PUBACK")
+    test.assert(mqttsession.inflight_count(s) == 1)
+
+    test.case("and gone after it")
+    test.assert(mqttsession.inflight_count(mqttsession.complete_outgoing(s, 4)) == 0)
+
+    test.case("an acknowledgement for something else changes nothing")
+    test.assert(mqttsession.inflight_count(mqttsession.complete_outgoing(s, 5)) == 1)
+
+@test
+fn test_a_duplicate_qos2_publication_is_delivered_once() [io]
+    // The exactly-once half of exactly-once, and the only place it
+    // lives.  A broker that did not get its PUBREC sends the PUBLISH
+    // again; a client that delivered it again has delivered twice.
+    let s = mqttsession.record_incoming(mqttsession.session("c"), 7)
+
+    test.case("the identifier is remembered")
+    test.assert(mqttsession.is_duplicate_incoming(s, 7))
+
+    test.case("a different one is not")
+    test.assert(not mqttsession.is_duplicate_incoming(s, 8))
+
+    test.case("and the PUBREL releases it, so the next 7 is a new message")
+    test.assert(not mqttsession.is_duplicate_incoming(
+        mqttsession.release_incoming(s, 7), 7))
+
+@test
+fn test_the_resend_schedule_is_arithmetic_over_two_arguments() [io]
+    // No clock, so the schedule is a table.
+    let f = MqttInflight { packet_id: 1, awaiting: Publish, qos: AtLeastOnce,
+                           packet: [0x32, 0x02], first_sent_ms: 1000, resends: 0 }
+    let s = mqttsession.record_outgoing(mqttsession.session("c"), f)
+
+    test.case("not yet due four seconds in, with a five-second interval")
+    test.assert(list.len(mqttsession.due_for_resend(s, 5000, 5000)) == 0)
+
+    test.case("due six seconds in")
+    test.assert(list.len(mqttsession.due_for_resend(s, 7000, 5000)) == 1)
+
+@test
+fn test_aliases_are_per_connection_and_a_reconnect_drops_them() [io]
+    // MQTT 5.0's topic aliases are scoped to one connection.  A client
+    // that carried them across publishes to whatever the NEW
+    // connection's alias 3 happens to mean — which is usually nothing,
+    // and occasionally somebody else's topic.
+    let s = mqttsession.learn_alias(mqttsession.session("c"), 3, "sensors/7/temp", true)
+
+    test.case("the alias resolves while the connection lasts")
+    match mqttsession.topic_for_alias(s, 3)
+        None    => test.assert(false)
+        Some(t) => test.assert(t == "sensors/7/temp")
+
+    test.case("and does not survive the reconnection")
+    match mqttsession.topic_for_alias(mqttsession.clear_aliases(s), 3)
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+
+@test
+fn test_a_stored_session_reads_back_and_a_wrong_one_is_refused() [io]
+    let f = MqttInflight { packet_id: 2, awaiting: Publish, qos: AtLeastOnce,
+                           packet: [0x32, 0x02], first_sent_ms: 0, resends: 0 }
+    let s = mqttsession.record_outgoing(mqttsession.session("sensor-7"), f)
+
+    test.case("what came out goes back in")
+    match mqttsession.decode(mqttsession.encode(s))
+        Err(_)   => test.assert(false)
+        Ok(back) =>
+            test.assert(back.client_id == "sensor-7")
+            test.assert(mqttsession.inflight_count(back) == 1)
+
+    test.case("and bytes that are not a session are refused rather than guessed")
+    match mqttsession.decode([])
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_clearing_keeps_the_subscriptions_because_they_are_the_callers_intent() [io]
+    // A resumed session keeps its subscriptions on the BROKER.  When
+    // the broker says the session was not present, the caller has to
+    // resubscribe — and can only do that if the client remembered what
+    // it had asked for.
+    let sub = MqttSubscription { filter: "sensors/#", qos: AtLeastOnce,
+                                 no_local: false, retain_as_published: false,
+                                 retain_handling: 0 }
+    let s = mqttsession.record_subscription(mqttsession.session("c"), sub)
+    let cleared = mqttsession.clear(s)
+
+    test.case("the in-flight table goes")
+    test.assert(mqttsession.inflight_count(cleared) == 0)
+
+    test.case("the subscriptions stay")
+    test.assert(list.len(cleared.subscriptions) == 1)
+
+    test.case("and an unsubscribe forgets one")
+    test.assert(list.len(
+        mqttsession.forget_subscription(cleared, "sensors/#").subscriptions) == 0)
+
+@test
+fn test_the_in_flight_table_is_readable_in_send_order() [io]
+    // Order is the send order and a resume keeps it, because a broker
+    // that receives a resumed session out of order can deliver out of
+    // order — which is a QoS 1 guarantee quietly weakened.
+    let first = MqttInflight { packet_id: 1, awaiting: Publish, qos: AtLeastOnce,
+                               packet: [0x32, 0x02], first_sent_ms: 0, resends: 0 }
+    let second = MqttInflight { packet_id: 2, awaiting: Publish, qos: AtLeastOnce,
+                                packet: [0x32, 0x02], first_sent_ms: 10, resends: 0 }
+    let s = mqttsession.record_outgoing(
+        mqttsession.record_outgoing(mqttsession.session("c"), first), second)
+
+    let out = mqttsession.outgoing_of(s)
+
+    test.case("both are there")
+    test.assert(list.len(out) == 2)
+
+    test.case("oldest first")
+    test.assert(list.get(out, 0).packet_id == 1)
+
+@test
+fn test_an_alias_this_client_taught_is_found_by_its_topic() [io]
+    // The outgoing direction: a client that has already sent the full
+    // topic once may send the number afterwards, which is what the
+    // feature is for.  The lookup is by topic, because that is what the
+    // caller has.
+    let s = mqttsession.learn_alias(mqttsession.session("c"), 5, "sensors/7/temp", false)
+
+    test.case("the topic finds the number it was taught")
+    match mqttsession.alias_for(s, "sensors/7/temp")
+        None    => test.assert(false)
+        Some(n) => test.assert(n == 5)
+
+    test.case("a topic that was never taught has no number")
+    match mqttsession.alias_for(s, "sensors/8/temp")
+        Some(_) => test.assert(false)
+        None    => test.assert(true)

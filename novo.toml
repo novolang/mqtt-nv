@@ -1,0 +1,60 @@
+[package]
+name        = "mqtt-nv"
+version     = "0.0.1"
+description = "The socket half of MQTT, over mqtt-codec-nv: a client value the host drives from its own loop — connect with the options, subscribe and unsubscribe, publish at QoS 0, 1 and 2 with the retransmission state machine, keep-alive and ping, the session as a value the host stores, a reconnection policy and the last will.  Interface only — every body is a todo()."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `host`, and the rows are not all the same.  `mqtttrans` dials a
+# socket and reads it: `[io, net]` for TCP through `std.net`, `[net]`
+# for TLS through `std.tls`, which is the narrower of the two because
+# the TLS surface declares only that.  `mqttclient.now_ms` is the one
+# function that reads a clock and the only `[time]` row in the package.
+# Everything else — the options, the session, the backoff policy, the
+# keep-alive arithmetic — declares NOTHING, because the client is a
+# value and the loop that drives it belongs to the caller.
+#
+# The driving functions are effect-POLYMORPHIC rather than effectful:
+# `poll<T: MqttTransport[e]>(…) [e]` costs whatever the caller's
+# transport costs, which is `[io, net]` over a TCP stream, `[net]` over
+# TLS, and whatever a board's HAL socket declares on a device.  That is
+# the shape `docs/publishing.md` § How a `core` package takes a stream
+# from its host describes, applied to a `host` package so that the
+# transport rather than this package decides what a call costs.
+layer       = "host"
+
+category    = "networking"
+
+tags        = ["mqtt", "mqtt5", "mqtt311", "client", "pubsub", "iot", "keep-alive", "qos"]
+repository  = "https://github.com/novolang/mqtt-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "The half of MQTT that owns a socket"
+
+[dependencies]
+# The `core` half of the split, and the direction the layer order
+# allows: a `host` package may depend on a `core` one.  Every packet
+# this package puts on a wire was built by mqtt-codec-nv and every
+# packet it reads was decoded there; nothing here does protocol
+# arithmetic, and the one place that rule is visible is
+# `mqttsession.MqttInflight`, which stores the ENCODED bytes of an
+# unacknowledged packet rather than re-encoding it on a resend.
+#
+# Under the caret rule a `0.0.x` version has no compatible neighbours:
+# `^0.0.2` means exactly 0.0.2, and a republished codec needs this line
+# edited.  mqtt-codec-nv is itself an INTERFACE today — 0.0.x,
+# `stability = "draft"`, every body a `todo()` — so a program that
+# assembles this closure builds and panics on the first packet.  That
+# is the interfaces-first milestone working as designed.
+mqtt-codec-nv = "^0.0.2"

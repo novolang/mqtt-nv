@@ -1,0 +1,436 @@
+// mqttsession.nv — the state that has to outlive a socket, as a value
+// the host stores.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// NOTHING HERE PERFORMS ANYTHING — every row is `[]`.  The session is
+// not a file, a database or a directory; it is a value, and where it
+// goes is the caller's decision.  A server puts it in Redis, a desktop
+// client in a file, a device in a flash page, a test in a variable.  A
+// package that had chosen for them would have added `[fs]` to every
+// program that only ever wanted the variable.
+//
+// THIS IS WHAT MAKES QoS MEAN ANYTHING.  A QoS 1 publication is
+// delivered at least once because the client keeps sending it until a
+// PUBACK arrives, and "until" spans reconnections and process
+// restarts.  A client whose in-flight table lived only in memory
+// delivers at-least-once until the program stops, which is a different
+// and much weaker promise than the one the caller asked for.
+//
+// THE PACKET IS STORED ENCODED.  `MqttInflight.packet` holds the bytes
+// mqtt-codec-nv produced, not the `MqttPublish` they came from.  The
+// specification requires a retransmission to be byte-identical except
+// for the DUP flag, and re-encoding on every resend is a second chance
+// to differ — a property section ordered differently, a topic alias
+// resolved against a table that has since changed.  Storing bytes also
+// means a resend costs no encoding at all, which matters on the part
+// where the resend is why the radio woke up.
+//
+// AND THE IDENTIFIERS COME FROM HERE, NOT FROM THE CLIENT.  A packet
+// identifier must not be reused while its exchange is open, and an
+// exchange survives a reconnection, so a counter that lived in the
+// client would restart at 1 on the connection that resumed a session
+// still holding 1.
+
+// One unacknowledged outgoing exchange.
+pub struct MqttInflight
+    packet_id: Int
+    // Which acknowledgement is outstanding.  `Publish` means a PUBACK
+    // (QoS 1) or a PUBREC (QoS 2) is owed; `PubRel` means the PUBREC
+    // arrived and a PUBCOMP is owed.  Those are the only two states a
+    // QoS 2 exchange can be interrupted in, and they need different
+    // packets on the way back.
+    awaiting: MqttPacketKind
+    qos: MqttQos
+    // The encoded packet, ready to send again.
+    packet: [u8]
+    // The host's clock reading when it first went out, in
+    // milliseconds — a number this package compares and never obtains.
+    first_sent_ms: Int
+    // How many times it has gone out since.
+    resends: Int
+
+// A topic alias learned on one connection.
+//
+// 5.0's aliases are per-connection, so this travels in the session
+// only so that `mqttclient` has one place to keep it; `clear_aliases`
+// is what a reconnection calls, and calling it is not optional.
+pub struct MqttTopicAlias
+    number: Int
+    topic: Str
+
+// Everything about a client that outlives one socket.
+pub struct MqttSession
+    client_id: Str
+    // Whether the broker said this session already existed, from the
+    // Session Present flag in the last CONNACK.
+    present: Bool
+    // Unacknowledged outgoing exchanges, oldest first.  Order is the
+    // send order and resends keep it, because a broker that receives
+    // a resumed session out of order can deliver out of order.
+    outgoing: [MqttInflight]
+    // Packet identifiers of QoS 2 publications that arrived and have
+    // not been released.  What stops a duplicate PUBLISH from being
+    // delivered twice across a reconnection — the exactly-once half of
+    // exactly-once.
+    incoming_ids: [Int]
+    // Subscriptions to restore when a session is NOT resumed.  A
+    // resumed session keeps them on the broker; this list is what
+    // turns `MqttSessionNotResumed` from a fault into a resubscribe.
+    subscriptions: [MqttSubscription]
+    // The next identifier to hand out.  1 to 65,535; 0 is not a
+    // packet identifier.
+    next_packet_id: Int
+    aliases_out: [MqttTopicAlias]
+    aliases_in: [MqttTopicAlias]
+
+// Why a stored session cannot be read back.
+pub enum MqttSessionFault
+    // Not this format at all.
+    MqttSessionBadMagic
+    // Written by a newer version of this package.
+    MqttSessionVersionUnknown(version: Int)
+    // The bytes end inside a record.
+    MqttSessionTruncated(at: Int)
+    // A stored packet identifier outside 1..65,535.
+    MqttSessionBadPacketId(at: Int, packet_id: Int)
+    // Two in-flight records with the same identifier, which no
+    // correct client can produce and which would make one of them
+    // permanently unacknowledgeable.
+    MqttSessionDuplicatePacketId(packet_id: Int)
+
+// An empty session for a client identifier.
+//
+// ```novo
+// use mqttsession
+//
+// fn main() [io]
+//     println(mqttsession.session("sensor-7").client_id)
+// ```
+pub fn session(client_id: Str) -> MqttSession []
+    todo("mqtt-nv.mqttsession.session")
+
+// The session with everything the broker no longer holds thrown away,
+// keeping the client identifier and the subscriptions.
+//
+// What a `clean_start` connection does, and what a caller does after
+// `MqttSessionNotResumed`.  The subscriptions survive because they are
+// the caller's intent rather than the broker's state, and dropping
+// them would make a resubscribe impossible to write.
+//
+// ```novo
+// use mqttsession
+//
+// fn main() [io]
+//     let s = mqttsession.clear(mqttsession.session("c"))
+//     println("${s.present}")
+// ```
+pub fn clear(s: MqttSession) -> MqttSession []
+    todo("mqtt-nv.mqttsession.clear")
+
+// Whether the broker reported this session as already present.
+//
+// ```novo
+// use mqttsession
+//
+// fn main() [io]
+//     let n = mqttsession.is_present(mqttsession.session("c"))
+//     println("${n}")
+// ```
+pub fn is_present(s: MqttSession) -> Bool []
+    todo("mqtt-nv.mqttsession.is_present")
+
+// The next free packet identifier, and the session that has handed it
+// out.
+//
+// `MqttPacketIdsExhausted` when all 65,535 are in flight.  It wraps
+// rather than growing, and it skips identifiers still outstanding,
+// which is why it takes the whole session and not a counter.
+//
+// ```novo
+// use mqttsession
+//
+// fn main() [io]
+//     match mqttsession.take_packet_id(mqttsession.session("c"))
+//         Ok(t)  => println("${t.packet_id}")
+//         Err(_) => println("exhausted")
+// ```
+pub fn take_packet_id(s: MqttSession) -> Result<MqttPacketIdTaken, MqttClientError> []
+    todo("mqtt-nv.mqttsession.take_packet_id")
+
+// A packet identifier, and the session it came out of.
+pub struct MqttPacketIdTaken
+    session: MqttSession
+    packet_id: Int
+
+// Record an outgoing exchange as unacknowledged.
+//
+// ```novo
+// use mqttsession
+//
+// fn main() [io]
+//     let n = mqttsession.inflight_count(mqttsession.session("c"))
+//     println("${n}")
+// ```
+pub fn record_outgoing(s: MqttSession, f: MqttInflight) -> MqttSession []
+    todo("mqtt-nv.mqttsession.record_outgoing")
+
+// Move a QoS 2 exchange from awaiting-PUBREC to awaiting-PUBCOMP,
+// replacing the stored packet with the PUBREL.
+//
+// The half of QoS 2 that a client written from the diagram forgets:
+// after a PUBREC the PUBLISH must never go out again, and the PUBREL
+// must, so the stored bytes have to be replaced rather than the record
+// simply flagged.
+//
+// ```novo
+// use mqttsession
+//
+// fn main() [io]
+//     let n = mqttsession.inflight_count(mqttsession.session("c"))
+//     println("${n}")
+// ```
+pub fn advance_to_pubrel(s: MqttSession, packet_id: Int, pubrel: [u8]) -> MqttSession []
+    todo("mqtt-nv.mqttsession.advance_to_pubrel")
+
+// Drop an exchange, its acknowledgement having arrived.
+//
+// ```novo
+// use mqttsession
+//
+// fn main() [io]
+//     let s = mqttsession.complete_outgoing(mqttsession.session("c"), 1)
+//     println("${mqttsession.inflight_count(s)}")
+// ```
+pub fn complete_outgoing(s: MqttSession, packet_id: Int) -> MqttSession []
+    todo("mqtt-nv.mqttsession.complete_outgoing")
+
+// Every unacknowledged outgoing exchange, in send order.
+//
+// ```novo
+// use mqttsession
+// use std.list
+//
+// fn main() [io]
+//     let n = list.len(mqttsession.outgoing_of(mqttsession.session("c")))
+//     println("${n}")
+// ```
+pub fn outgoing_of(s: MqttSession) -> [MqttInflight] []
+    todo("mqtt-nv.mqttsession.outgoing_of")
+
+// How many exchanges are unacknowledged.
+//
+// What the send quota is measured against, which is why it is one
+// function rather than a caller counting a list.
+//
+// ```novo
+// use mqttsession
+//
+// fn main() [io]
+//     let n = mqttsession.inflight_count(mqttsession.session("c"))
+//     println("${n}")
+// ```
+pub fn inflight_count(s: MqttSession) -> Int []
+    todo("mqtt-nv.mqttsession.inflight_count")
+
+// The exchanges that have been waiting longer than `after_ms` at the
+// clock reading `now_ms`.
+//
+// Both are arguments, so a resend schedule is a table a test asserts.
+//
+// ```novo
+// use mqttsession
+// use std.list
+//
+// fn main() [io]
+//     let due = mqttsession.due_for_resend(mqttsession.session("c"), 0, 5000)
+//     println("${list.len(due)}")
+// ```
+pub fn due_for_resend(s: MqttSession, now_ms: Int, after_ms: Int) -> [MqttInflight] []
+    todo("mqtt-nv.mqttsession.due_for_resend")
+
+// The encoded packets a resumed session owes the broker, in order,
+// with the DUP flag set where the protocol requires it.
+//
+// This is the whole of what resumption means on the sending side, and
+// it is one function so that a caller who has just reconnected has one
+// thing to do rather than a loop to write correctly.
+//
+// ```novo
+// use mqttsession
+// use std.list
+//
+// fn main() [io]
+//     let n = list.len(mqttsession.resume_packets(mqttsession.session("c")))
+//     println("${n}")
+// ```
+pub fn resume_packets(s: MqttSession) -> [[u8]] []
+    todo("mqtt-nv.mqttsession.resume_packets")
+
+// Record a QoS 2 publication as received and not yet released.
+//
+// ```novo
+// use mqttsession
+//
+// fn main() [io]
+//     let s = mqttsession.record_incoming(mqttsession.session("c"), 7)
+//     println("${mqttsession.is_duplicate_incoming(s, 7)}")
+// ```
+pub fn record_incoming(s: MqttSession, packet_id: Int) -> MqttSession []
+    todo("mqtt-nv.mqttsession.record_incoming")
+
+// Release a recorded QoS 2 publication, its PUBREL having arrived.
+//
+// ```novo
+// use mqttsession
+//
+// fn main() [io]
+//     let s = mqttsession.release_incoming(mqttsession.session("c"), 7)
+//     println("${mqttsession.is_duplicate_incoming(s, 7)}")
+// ```
+pub fn release_incoming(s: MqttSession, packet_id: Int) -> MqttSession []
+    todo("mqtt-nv.mqttsession.release_incoming")
+
+// True when a QoS 2 PUBLISH with this identifier has already been
+// delivered and not yet released.
+//
+// The one predicate that makes exactly-once exact.  A client that
+// answered a duplicate PUBREC with a delivery has delivered twice.
+//
+// ```novo
+// use mqttsession
+//
+// fn main() [io]
+//     let n = mqttsession.is_duplicate_incoming(mqttsession.session("c"), 7)
+//     println("${n}")
+// ```
+pub fn is_duplicate_incoming(s: MqttSession, packet_id: Int) -> Bool []
+    todo("mqtt-nv.mqttsession.is_duplicate_incoming")
+
+// Remember a subscription so a session that failed to resume can be
+// rebuilt.
+//
+// ```novo
+// use mqttsession
+// use std.list
+//
+// fn main() [io]
+//     let s = mqttsession.session("c")
+//     println("${list.len(s.subscriptions)}")
+// ```
+pub fn record_subscription(s: MqttSession, sub: MqttSubscription) -> MqttSession []
+    todo("mqtt-nv.mqttsession.record_subscription")
+
+// Forget a subscription, its UNSUBACK having arrived.
+//
+// ```novo
+// use mqttsession
+// use std.list
+//
+// fn main() [io]
+//     let s = mqttsession.forget_subscription(mqttsession.session("c"), "a/b")
+//     println("${list.len(s.subscriptions)}")
+// ```
+pub fn forget_subscription(s: MqttSession, filter: Str) -> MqttSession []
+    todo("mqtt-nv.mqttsession.forget_subscription")
+
+// The alias this connection has taught the broker for a topic, if any.
+//
+// ```novo
+// use mqttsession
+//
+// fn main() [io]
+//     match mqttsession.alias_for(mqttsession.session("c"), "a/b")
+//         Some(n) => println("${n}")
+//         None    => println("no alias")
+// ```
+pub fn alias_for(s: MqttSession, topic: Str) -> ?Int []
+    todo("mqtt-nv.mqttsession.alias_for")
+
+// The topic a broker's alias stands for, if this connection has been
+// told.
+//
+// `None` is `mqttclienterr.MqttTopicAliasUnknown`, and a client that
+// guessed instead would deliver a message under the wrong topic.
+//
+// ```novo
+// use mqttsession
+//
+// fn main() [io]
+//     match mqttsession.topic_for_alias(mqttsession.session("c"), 3)
+//         Some(t) => println(t)
+//         None    => println("unknown")
+// ```
+pub fn topic_for_alias(s: MqttSession, number: Int) -> ?Str []
+    todo("mqtt-nv.mqttsession.topic_for_alias")
+
+// Learn an alias the broker sent, or record one this client has taught.
+//
+// ```novo
+// use mqttsession
+//
+// fn main() [io]
+//     let s = mqttsession.learn_alias(mqttsession.session("c"), 3, "a/b", true)
+//     println("${mqttsession.is_present(s)}")
+// ```
+pub fn learn_alias(s: MqttSession, number: Int, topic: Str, incoming: Bool) -> MqttSession []
+    todo("mqtt-nv.mqttsession.learn_alias")
+
+// Drop every alias in both directions.
+//
+// What a reconnection must call.  5.0's aliases are per-connection and
+// a client that carried them across would publish to whatever the new
+// connection's alias 3 happens to mean.
+//
+// ```novo
+// use mqttsession
+//
+// fn main() [io]
+//     let s = mqttsession.clear_aliases(mqttsession.session("c"))
+//     println("${mqttsession.is_present(s)}")
+// ```
+pub fn clear_aliases(s: MqttSession) -> MqttSession []
+    todo("mqtt-nv.mqttsession.clear_aliases")
+
+// The session as bytes, for whatever the caller stores it in.
+//
+// A format of this package's own rather than a general serializer,
+// because the thing being stored is mostly already-encoded packets and
+// a general format would encode them a second time.
+//
+// ```novo
+// use mqttsession
+// use std.list
+//
+// fn main() [io]
+//     let n = list.len(mqttsession.encode(mqttsession.session("c")))
+//     println("${n}")
+// ```
+pub fn encode(s: MqttSession) -> [u8] []
+    todo("mqtt-nv.mqttsession.encode")
+
+// A session read back from bytes.
+//
+// ```novo
+// use mqttsession
+//
+// fn main() [io]
+//     match mqttsession.decode([])
+//         Ok(s)  => println(s.client_id)
+//         Err(_) => println("not a session")
+// ```
+pub fn decode(data: [u8]) -> Result<MqttSession, MqttSessionFault> []
+    todo("mqtt-nv.mqttsession.decode")
+
+// Why a stored session could not be read.
+//
+// ```novo
+// use mqttsession
+//
+// fn main() [io]
+//     let f: MqttSessionFault = MqttSessionBadMagic
+//     println(f.message())
+// ```
+impl Error for MqttSessionFault
+    fn message(self) -> Str
+        todo("mqtt-nv.mqttsession.MqttSessionFault.message")

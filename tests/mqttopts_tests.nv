@@ -1,0 +1,189 @@
+// mqttopts_tests.nv — the options, and the CONNECT they mean.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: mqtt-nv.<module>.<fn>`.
+// That is the expected result until the bodies land.
+//
+// THE ASSERTIONS ARE ABOUT REFUSALS, mostly.  A set of options that is
+// accepted produces a CONNECT a broker answers, and there is nothing
+// interesting to say about it; the interesting cases are the four
+// combinations the MQTT specification forbids and that a client which
+// did not check would send anyway, getting a connection closed with no
+// explanation on a broker that does not send 5.0 reason codes.
+
+use std.test
+use std.list
+use mqttopts
+
+@test
+fn test_the_defaults_are_survivable_rather_than_the_specifications() [io]
+    let o = mqttopts.options("sensor-7")
+
+    test.case("the identifier is kept")
+    test.assert(o.client_id == "sensor-7")
+
+    test.case("5.0 by default — the version a new deployment should pick")
+    test.assert(o.version == Mqtt50)
+
+    test.case("a clean start, so a first run needs no stored session")
+    test.assert(o.clean_start)
+
+    test.case("a bounded Receive Maximum, which the protocol's own default is not")
+    test.assert(o.receive_maximum > 0)
+
+    test.case("a bounded Maximum Packet Size, for the same reason")
+    test.assert(o.max_packet_size > 0)
+
+    test.case("a keep-alive inside the field's range")
+    test.assert(o.keep_alive_secs > 0 and o.keep_alive_secs <= 65535)
+
+@test
+fn test_the_device_profile_differs_in_what_it_costs_not_what_it_does() [io]
+    let d = mqttopts.rt_profile("node-3")
+    let o = mqttopts.options("node-3")
+
+    test.case("3.1.1, because 5.0's property sections are what allocates")
+    test.assert(d.version == Mqtt311)
+
+    test.case("one publication in flight, so the session holds one packet")
+    test.assert(d.receive_maximum == 1)
+
+    test.case("a smaller maximum packet than the default")
+    test.assert(d.max_packet_size < o.max_packet_size)
+
+    test.case("and a longer keep-alive, because a radio wake-up costs power")
+    test.assert(d.keep_alive_secs > o.keep_alive_secs)
+
+@test
+fn test_the_four_refusals_the_specification_requires() [io]
+    test.case("an empty identifier on 3.1.1 without a clean start")
+    let a = mqttopts.with_session(
+        mqttopts.with_version(mqttopts.options(""), Mqtt311), false, 0)
+    test.assert(list.len(mqttopts.faults(a)) > 0)
+
+    test.case("a Receive Maximum of zero is a protocol error, not 'none'")
+    let b = mqttopts.with_limits(mqttopts.options("c"), 0, 65536, 0)
+    test.assert(list.len(mqttopts.faults(b)) > 0)
+
+    test.case("a Maximum Packet Size of zero, likewise")
+    let c = mqttopts.with_limits(mqttopts.options("c"), 10, 0, 0)
+    test.assert(list.len(mqttopts.faults(c)) > 0)
+
+    test.case("a keep-alive that does not fit the two-byte field")
+    let d = mqttopts.with_keep_alive(mqttopts.options("c"), 65536)
+    test.assert(list.len(mqttopts.faults(d)) > 0)
+
+@test
+fn test_options_that_are_fine_have_no_faults() [io]
+    test.case("the defaults")
+    test.assert(list.len(mqttopts.faults(mqttopts.options("sensor-7"))) == 0)
+
+    test.case("the device profile")
+    test.assert(list.len(mqttopts.faults(mqttopts.rt_profile("node-3"))) == 0)
+
+    test.case("an empty identifier WITH a clean start, which 5.0 allows")
+    let o = mqttopts.with_session(mqttopts.options(""), true, 0)
+    test.assert(list.len(mqttopts.faults(o)) == 0)
+
+@test
+fn test_the_options_are_the_connect_packet() [io]
+    // The whole point of the module: a configuration is testable
+    // because it turns into a value, with no broker in the room.
+    let o = mqttopts.with_keep_alive(mqttopts.options("sensor-7"), 30)
+
+    match mqttopts.connect_packet(o)
+        Err(_) => test.assert(false)
+        Ok(p)  =>
+            test.case("the identifier travels")
+            test.assert(p.client_id == "sensor-7")
+
+            test.case("and so does the keep-alive, in seconds")
+            test.assert(p.keep_alive == 30)
+
+@test
+fn test_the_keep_alive_is_read_out_in_milliseconds() [io]
+    // Everything in this package counts in milliseconds and MQTT's
+    // field is seconds, so the conversion lives in one place rather
+    // than at every call site that compares a clock reading.
+    let o = mqttopts.with_keep_alive(mqttopts.options("c"), 30)
+
+    test.case("thirty seconds is thirty thousand milliseconds")
+    test.assert(mqttopts.keep_alive_ms(o) == 30000)
+
+    test.case("and zero stays zero, which turns keep-alive off")
+    test.assert(mqttopts.keep_alive_ms(mqttopts.with_keep_alive(o, 0)) == 0)
+
+@test
+fn test_the_unlimited_profile_is_for_the_caller_who_means_it() [io]
+    // MQTT's own defaults are "unlimited" almost everywhere, and a
+    // client that took them literally buffers without bound the first
+    // time a broker stops acknowledging.  That is why it is a separate
+    // function rather than what `options` gives you.
+    let u = mqttopts.unlimited("bridge")
+    let o = mqttopts.options("bridge")
+
+    test.case("a larger Receive Maximum than the survivable default")
+    test.assert(u.receive_maximum > o.receive_maximum)
+
+    test.case("and a larger packet size")
+    test.assert(u.max_packet_size > o.max_packet_size)
+
+@test
+fn test_credentials_and_a_will_travel_into_the_connect() [io]
+    let c = MqttCredentials { username: "sensor", password: [0x6B, 0x65, 0x79] }
+    let w = MqttWill { topic: "sensors/7/status", payload: [0x30], qos: AtLeastOnce,
+                       retain: true, properties: [] }
+    let o = mqttopts.with_will(
+        mqttopts.with_credentials(mqttopts.options("sensor-7"), c), w)
+
+    match mqttopts.connect_packet(o)
+        Err(_) => test.assert(false)
+        Ok(p)  =>
+            test.case("the username is on the packet")
+            match p.username
+                None    => test.assert(false)
+                Some(u) => test.assert(u == "sensor")
+
+            test.case("the password is bytes, because the specification says so")
+            match p.password
+                None    => test.assert(false)
+                Some(_) => test.assert(true)
+
+            test.case("and the will is the one the caller gave")
+            match p.will
+                None    => test.assert(false)
+                Some(k) => test.assert(k.topic == "sensors/7/status")
+
+@test
+fn test_a_wildcard_in_a_will_topic_is_refused_before_the_broker_sees_it() [io]
+    // A will topic is a topic NAME, and a broker answers a wildcard in
+    // one by refusing the CONNECT — with no reason code at all on
+    // 3.1.1, which is a connection that closes and says nothing.
+    let w = MqttWill { topic: "sensors/+/status", payload: [], qos: AtMostOnce,
+                       retain: false, properties: [] }
+    let o = mqttopts.with_will(mqttopts.options("c"), w)
+
+    test.case("the fault is caught here rather than on the wire")
+    test.assert(list.len(mqttopts.faults(o)) > 0)
+
+@test
+fn test_the_decoder_limits_and_the_timings_are_the_callers() [io]
+    // Both exist so that a device and a server can use the same
+    // functions with different numbers, rather than the package
+    // choosing one set for both.
+    let o = mqttopts.with_timeouts(
+        mqttopts.with_decode_limits(mqttopts.options("c"),
+                                    MqttLimits { max_packet: 2048, max_properties: 8 }),
+        5000, 10000, 0)
+
+    test.case("the decoder's packet limit is the one that was set")
+    test.assert(o.limits.max_packet == 2048)
+
+    test.case("the CONNACK timeout is the one that was set")
+    test.assert(o.connack_timeout_ms == 5000)
+
+    test.case("the ping timeout is separate from the keep-alive interval")
+    test.assert(o.ping_timeout_ms == 10000)
+
+    test.case("and zero means never resend on the same connection")
+    test.assert(o.resend_after_ms == 0)

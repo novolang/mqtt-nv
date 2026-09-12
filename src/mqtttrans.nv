@@ -1,0 +1,202 @@
+// mqtttrans.nv — the one trait that crosses the layer, and the two
+// transports this package ships over the standard library.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `MqttTransport[e]` IS THE LOAD-BEARING INTERFACE OF THIS PACKAGE.
+// Everything in `mqttclient` is generic over it and charged what it
+// costs, so a caller decides what an MQTT client is allowed to do by
+// deciding which transport to hand it:
+//
+//   MqttTcp          [io, net]   a `std.net` TcpStream
+//   MqttTls          [net]       a `std.tls` connection
+//   the caller's own [whatever]  a board's socket, a unix socket, a
+//                                serial link to a cellular module, a
+//                                recorded conversation in a test
+//
+// The fourth row is the one that pays for the trait.  An MQTT client
+// whose transport is a fixed `TcpStream` can only be tested against a
+// broker; one whose transport is a trait is tested against a byte
+// script, and every keep-alive, retransmission and reconnection path —
+// which is most of what this package is — becomes a table rather than
+// a flaky integration run.
+//
+// WHY NOT std.io_traits' `Read[e]` AND `Write[e]`.  Two reasons, and
+// the second is the one that decides it.  A bound of two traits at
+// once (`<T: Read[e] + Write[e]>`) makes every signature in
+// `mqttclient` twice as wide for no reading gain.  And MQTT needs a
+// third thing neither of them has: `mqtt_is_open`, the question a
+// reconnection loop asks before it decides whether it is reconnecting
+// or connecting, answered without performing anything — which is why
+// it is the one method in the trait with no effect row.
+//
+// A TRANSPORT DOES NOT FRAME.  It moves bytes.  Everything about MQTT
+// packets is mqtt-codec-nv's, and the reason to say so here is that
+// the obvious mistake in a `recv` implementation is to return "one
+// packet": a transport that did would have to parse, and a transport
+// that parses is a second decoder that eventually disagrees with the
+// first.
+
+// A byte pipe an MQTT client can be driven over.
+//
+// `e` is the effect row the implementation supplies, and it is what a
+// call in `mqttclient` costs: nothing at all for a transport over a
+// buffer, `[io, net]` for a TCP stream, whatever a board declares for
+// a HAL socket.  SPEC § 5.6.
+pub trait MqttTransport[e]
+    // Hand the transport bytes.  The answer is how many it took; a
+    // short write is not a failure, and the caller sends the rest.
+    fn mqtt_send(self, data: Bytes) -> Result<Int, IoError> [e]
+    // Up to `max` bytes.  An EMPTY answer means the peer closed —
+    // which is different from `IoTimedOut`, and a transport that
+    // confused the two would make every broker restart look like a
+    // dead network.
+    fn mqtt_recv(self, max: Int) -> Result<Bytes, IoError> [e]
+    // Close it.  Calling this twice is not an error.
+    fn mqtt_close(self) -> ?IoError [e]
+    // Whether the transport believes it is open.  The one method with
+    // no effect row: a reconnection loop asks it on every turn, and a
+    // question that costs `[io]` to ask is a question a caller starts
+    // caching.
+    fn mqtt_is_open(self) -> Bool
+
+// MQTT over a plain TCP socket.
+pub struct MqttTcp
+    stream: TcpStream
+
+// MQTT over TLS, through the standard library's connection handles.
+//
+// The handle is an `Int` because that is what `std.tls` answers; the
+// hostname is kept beside it so a reconnection can verify the same
+// name without the caller having to remember which one it used.
+pub struct MqttTls
+    conn: Int
+    hostname: Str
+
+// The default MQTT port, 1883.
+pub const MQTT_PORT = 1883
+
+// The default MQTT-over-TLS port, 8883.
+pub const MQTT_TLS_PORT = 8883
+
+// Open a TCP connection to a broker.
+//
+// `[io, net]`, which is `std.net`'s own row for a connect and a read.
+//
+// ```novo
+// use mqtttrans
+//
+// fn main() [io]
+//     println("${mqtttrans.MQTT_PORT}")
+// ```
+pub fn dial_tcp(host: Str, port: Int) -> Result<MqttTcp, IoError> [io, net]
+    todo("mqtt-nv.mqtttrans.dial_tcp")
+
+// Open a TCP connection with a receive timeout already set on it.
+//
+// A separate function rather than a field on the options, because the
+// timeout belongs to the socket and not to the protocol: a caller
+// driving several brokers from one loop sets it once per socket and
+// never thinks about it again.
+//
+// ```novo
+// use mqtttrans
+//
+// fn main() [io]
+//     println("${mqtttrans.MQTT_PORT}")
+// ```
+pub fn dial_tcp_timeout(host: Str, port: Int,
+                        recv_timeout_ms: Int) -> Result<MqttTcp, IoError> [io, net]
+    todo("mqtt-nv.mqtttrans.dial_tcp_timeout")
+
+// Open a TLS connection to a broker.
+//
+// `[net]` and not `[io, net]`, which is `std.tls`'s own row.  The
+// narrower row is not a rounding: it is what the standard library
+// declares, and a caller in a sandbox that grants `[net]` and refuses
+// `[io]` can run this and not `dial_tcp`.
+//
+// ```novo
+// use mqtttrans
+//
+// fn main() [io]
+//     println("${mqtttrans.MQTT_TLS_PORT}")
+// ```
+pub fn dial_tls(host: Str, port: Int, cfg: TlsConfig) -> Result<MqttTls, IoError> [net]
+    todo("mqtt-nv.mqtttrans.dial_tls")
+
+// A client-side TLS configuration for a broker hostname, with peer
+// verification on.
+//
+// One line, and it exists so that the ordinary secure case does not
+// require a caller to have read `std.tls` first.
+//
+// ```novo
+// use mqtttrans
+//
+// fn main() [io]
+//     let cfg = mqtttrans.tls_for("broker.example.com")
+//     println("${mqtttrans.MQTT_TLS_PORT}")
+// ```
+pub fn tls_for(hostname: Str) -> TlsConfig []
+    todo("mqtt-nv.mqtttrans.tls_for")
+
+// The TcpStream inside, for a caller that has to set a socket option
+// this package does not wrap.
+//
+// ```novo
+// use mqtttrans
+//
+// fn main() [io]
+//     println("${mqtttrans.MQTT_PORT}")
+// ```
+pub fn stream_of(t: MqttTcp) -> TcpStream []
+    todo("mqtt-nv.mqtttrans.stream_of")
+
+// MQTT over a TCP stream.
+//
+// ```novo ignore
+// use mqttclient
+// use mqtttrans
+//
+// fn run(c: MqttClient, t: MqttTcp, now_ms: Int) [io, net]
+//     match mqttclient.poll(c, t, now_ms)
+//         Ok(_)  => nothing()
+//         Err(_) => nothing()
+// ```
+impl MqttTransport[io, net] for MqttTcp
+    fn mqtt_send(self, data: Bytes) -> Result<Int, IoError> [io, net]
+        todo("mqtt-nv.mqtttrans.MqttTcp.mqtt_send")
+
+    fn mqtt_recv(self, max: Int) -> Result<Bytes, IoError> [io, net]
+        todo("mqtt-nv.mqtttrans.MqttTcp.mqtt_recv")
+
+    fn mqtt_close(self) -> ?IoError [io, net]
+        todo("mqtt-nv.mqtttrans.MqttTcp.mqtt_close")
+
+    fn mqtt_is_open(self) -> Bool
+        todo("mqtt-nv.mqtttrans.MqttTcp.mqtt_is_open")
+
+// MQTT over TLS.
+//
+// ```novo ignore
+// use mqttclient
+// use mqtttrans
+//
+// fn run(c: MqttClient, t: MqttTls, now_ms: Int) [net]
+//     match mqttclient.poll(c, t, now_ms)
+//         Ok(_)  => nothing()
+//         Err(_) => nothing()
+// ```
+impl MqttTransport[net] for MqttTls
+    fn mqtt_send(self, data: Bytes) -> Result<Int, IoError> [net]
+        todo("mqtt-nv.mqtttrans.MqttTls.mqtt_send")
+
+    fn mqtt_recv(self, max: Int) -> Result<Bytes, IoError> [net]
+        todo("mqtt-nv.mqtttrans.MqttTls.mqtt_recv")
+
+    fn mqtt_close(self) -> ?IoError [net]
+        todo("mqtt-nv.mqtttrans.MqttTls.mqtt_close")
+
+    fn mqtt_is_open(self) -> Bool
+        todo("mqtt-nv.mqtttrans.MqttTls.mqtt_is_open")

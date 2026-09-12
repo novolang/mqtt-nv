@@ -1,0 +1,140 @@
+// mqttclienterr.nv — the ways a client fails, and the two questions a
+// caller always has to answer about each of them.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// A DECODE FAULT AND A CONNECTION FAULT ARE DIFFERENT THINGS, and
+// neither of them is a broker saying no.  mqtt-codec-nv already
+// separates `MqttDecodeError` from `MqttEncodeError`; this package adds
+// the third audience — the socket — and the fourth — the broker's own
+// refusal, which arrives as a reason code in a CONNACK or a DISCONNECT
+// and is a protocol SUCCESS.  A client that folded all four into one
+// enum could not answer `is_reconnectable`, and answering it is the
+// whole reason a caller catches an error here at all.
+//
+// WHICH IS WHY EVERY VARIANT NAME BEGINS `Mqtt`.  mqtt-codec-nv's own
+// variants are unprefixed — `Connect`, `Complete`, `NeedMore`,
+// `PacketTooLarge` — and a variant is constructed by name across the
+// whole assembly (docs/publishing.md § Public type names are globally
+// unique), so a second `PacketTooLarge` in a program holding both
+// packages would bind the wrong one.  The prefix is not decoration.
+
+// Why a client stopped.
+pub enum MqttClientError
+    // The transport said no.  The `IoError` is the standard library's,
+    // so a caller that already branches on `IoTimedOut` for its own
+    // sockets branches the same way here.
+    MqttTransportFailed(cause: IoError)
+    // The broker read the CONNECT and refused it.  This is a protocol
+    // SUCCESS: the packets parsed, the exchange completed, and the
+    // answer was no.  Reconnecting with the same options will be
+    // refused again, which is why `is_reconnectable` says false.
+    MqttConnectRefused(reason: MqttReasonCode)
+    // A command was issued before the CONNACK arrived.  MQTT allows
+    // exactly one packet before it — the CONNECT — and a broker that
+    // receives a second must close the connection.
+    MqttNotConnected
+    // `connect` on a client that already holds a session on a wire.
+    MqttAlreadyConnected
+    // The keep-alive budget passed with a PINGREQ outstanding.  The
+    // connection is dead whatever the socket still believes, which is
+    // the case a TCP read timeout alone cannot see.
+    MqttKeepAliveExpired(elapsed_ms: Int)
+    // The broker sent a DISCONNECT.  MQTT 5.0 only; on 3.1.1 a broker
+    // that wants the connection gone closes the socket, and the caller
+    // gets `MqttTransportFailed` instead.
+    MqttBrokerDisconnected(reason: MqttReasonCode)
+    // Every one of the 65,535 packet identifiers is in flight.  The
+    // caller has to drain before it can send again; nothing is wrong.
+    MqttPacketIdsExhausted
+    // More unacknowledged QoS 1 and 2 publications than the broker's
+    // Receive Maximum allows.  Sending past it is a protocol error the
+    // broker answers by closing the connection, so this package
+    // refuses first.
+    MqttSendQuotaExceeded(quota: Int)
+    // The packet is larger than the Maximum Packet Size the broker
+    // announced in its CONNACK.
+    MqttPacketTooLargeForBroker(len: Int, limit: Int)
+    // A PUBLISH arrived carrying a topic alias this connection has
+    // never been taught, so there is no topic to deliver it under.
+    MqttTopicAliasUnknown(topic_alias: Int)
+    // mqtt-codec-nv refused the bytes that arrived.
+    MqttIncomingRefused(cause: MqttDecodeError)
+    // mqtt-codec-nv refused to build the packet this client asked for.
+    MqttOutgoingRefused(cause: MqttEncodeError)
+    // `clean_start` was false and the broker answered with no session
+    // present, so the subscriptions and the in-flight publications the
+    // caller was counting on are gone.  A resumption that silently
+    // continued would drop messages the caller believes are queued.
+    MqttSessionNotResumed
+    // The reconnection policy ran out of attempts.
+    MqttReconnectGaveUp(attempts: Int)
+
+// The one-line reading, for a log or a person.
+//
+// ```novo
+// use mqttclienterr
+//
+// fn main() [io]
+//     let e: MqttClientError = MqttNotConnected
+//     println(e.message())
+// ```
+impl Error for MqttClientError
+    fn message(self) -> Str
+        todo("mqtt-nv.mqttclienterr.message")
+
+// True when opening a NEW connection could succeed where this one
+// failed.
+//
+// The distinction this exists to make: a refused CONNECT and an
+// expired keep-alive both end a connection, and only one of them is
+// worth trying again.  A client that retried an `MqttConnectRefused`
+// reconnects forever against a broker that has already said no, which
+// is how a mistyped password becomes a denial of service against the
+// broker that rejected it.
+//
+// ```novo
+// use mqttclienterr
+//
+// fn main() [io]
+//     println("${mqttclienterr.is_reconnectable(MqttNotConnected)}")
+// ```
+pub fn is_reconnectable(e: MqttClientError) -> Bool []
+    todo("mqtt-nv.mqttclienterr.is_reconnectable")
+
+// True when the session's in-flight state is still worth keeping.
+//
+// A transport failure leaves the session valid — that is what QoS 1
+// and 2 are for, and the unacknowledged packets go out again on the
+// next connection.  A refused CONNECT and an `MqttSessionNotResumed`
+// do not: the broker has no matching state, so holding the packets
+// only delays the caller learning they were lost.
+//
+// ```novo
+// use mqttclienterr
+//
+// fn main() [io]
+//     println("${mqttclienterr.keeps_session(MqttNotConnected)}")
+// ```
+pub fn keeps_session(e: MqttClientError) -> Bool []
+    todo("mqtt-nv.mqttclienterr.keeps_session")
+
+// The reason code this client would put in a DISCONNECT it sent
+// because of this fault, or `None` where the right answer is to close
+// the socket without one.
+//
+// MQTT 5.0 lets a client explain itself on the way out and 3.1.1 does
+// not, so the answer also depends on the version the caller is on —
+// which is why it is the client, not this function, that decides
+// whether to send the packet at all.
+//
+// ```novo
+// use mqttclienterr
+//
+// fn main() [io]
+//     match mqttclienterr.disconnect_reason(MqttNotConnected)
+//         Some(_) => println("with a reason")
+//         None    => println("close the socket")
+// ```
+pub fn disconnect_reason(e: MqttClientError) -> ?MqttReasonCode []
+    todo("mqtt-nv.mqttclienterr.disconnect_reason")

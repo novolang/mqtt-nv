@@ -1,0 +1,318 @@
+// mqttopts.nv — everything a caller decides before a socket exists.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// NOTHING HERE PERFORMS ANYTHING — every row is `[]`.  The options are
+// a value, `connect_packet` turns them into the codec's `MqttConnect`,
+// and the only thing that touches a wire is `mqttclient.connect`,
+// which takes both.  That split is what makes a configuration testable:
+// a test asserts the CONNECT a set of options produces without a broker
+// in the room, and a broker's refusal in the field is reproducible from
+// the options alone.
+//
+// THE DEFAULTS ARE rumqttc's, NOT THE SPECIFICATION'S.  MQTT's own
+// defaults are "unlimited" almost everywhere — no Receive Maximum, no
+// Maximum Packet Size, no session expiry — and a client that took them
+// literally buffers without bound the first time a broker stops
+// acknowledging.  `options` therefore starts from numbers a program can
+// survive, and `unlimited()` is there for the caller who means it.
+
+// Username and password, as MQTT carries them.
+//
+// The password is bytes and not `Str` because the specification says
+// so: a password is binary data with a two-byte length, and a broker
+// whose password is a 32-byte key is a broker a `Str` field cannot
+// talk to.
+pub struct MqttCredentials
+    username: Str
+    password: [u8]
+
+// Everything a CONNECT carries, plus the four timings the client needs
+// and the broker never sees.
+pub struct MqttOptions
+    // 3.1.1 or 5.0.  A parameter and never a build flag, for the same
+    // reason mqtt-codec-nv made it one: a fleet crosses versions.
+    version: MqttVersion
+    // The client identifier.  Empty asks the broker to assign one,
+    // which 5.0 returns in the CONNACK and 3.1.1 only allows with a
+    // clean session.
+    client_id: Str
+    // Seconds between packets before the client owes a PINGREQ.  Zero
+    // turns keep-alive off, and turns `MqttKeepAliveExpired` off with
+    // it — a connection that dies quietly then stays open until the
+    // socket notices, which can be hours.
+    keep_alive_secs: Int
+    // 5.0's Clean Start, 3.1.1's Clean Session.  False asks the broker
+    // to resume; `MqttSessionNotResumed` is what the caller gets when
+    // it says there was nothing to resume.
+    clean_start: Bool
+    credentials: ?MqttCredentials
+    // The last will, published by the broker if this connection ends
+    // without a DISCONNECT.  mqtt-codec-nv's type, unchanged.
+    will: ?MqttWill
+    // 5.0's Session Expiry Interval, in seconds.  How long the broker
+    // keeps the session after the socket goes.  Ignored on 3.1.1,
+    // where a session lives until a clean one replaces it.
+    session_expiry_secs: Int
+    // How many QoS 1 and 2 publications may be unacknowledged at once.
+    // This is the client's own limit, announced to the broker; the
+    // broker announces its own in the CONNACK and the smaller wins.
+    receive_maximum: Int
+    // The largest packet this client will accept, in bytes.
+    max_packet_size: Int
+    // The highest topic alias this client will accept.  Zero refuses
+    // aliases, which is the right answer for a client that does not
+    // want per-connection state it has to get right.
+    topic_alias_maximum: Int
+    // The decoder's limits, handed straight to `mqttread.reader`.
+    limits: MqttLimits
+    // How long `connect` waits for a CONNACK before giving up.
+    connack_timeout_ms: Int
+    // How long the client waits for a PINGRESP before calling the
+    // connection dead.  Separate from `keep_alive_secs`, because the
+    // interval at which you ask and the patience you have for an
+    // answer are two different numbers and a broker under load needs
+    // the second one to be larger.
+    ping_timeout_ms: Int
+    // How long an unacknowledged QoS 1 or 2 packet waits before it is
+    // sent again on the SAME connection.  Zero means never — resend
+    // only on reconnection, which is what the specification requires
+    // and what most brokers expect.
+    resend_after_ms: Int
+
+// Why a set of options cannot be used.
+pub enum MqttOptionsFault
+    // Empty on 3.1.1 with `clean_start` false: the specification
+    // refuses it, because there is no name under which to resume.
+    MqttEmptyClientIdNeedsCleanStart
+    // Longer than 65,535 bytes, which is the field's own limit.
+    MqttClientIdTooLong(len: Int)
+    // Not valid UTF-8, or carrying a code point MQTT strings forbid.
+    MqttClientIdNotAMqttString
+    // Outside 0..65,535.
+    MqttKeepAliveOutOfRange(secs: Int)
+    // Zero.  A Receive Maximum of zero is a protocol error, not a way
+    // of saying "none".
+    MqttReceiveMaximumIsZero
+    // Zero, or larger than the 268,435,455 a remaining length can
+    // express.
+    MqttMaxPacketSizeOutOfRange(size: Int)
+    // A will whose topic is not a valid topic NAME — a wildcard in a
+    // will is the mistake this catches, and a broker answers it by
+    // refusing the CONNECT.
+    MqttWillTopicInvalid(fault: MqttTopicFault)
+    // A will at a QoS the connection cannot carry, or a 3.1.1 will
+    // carrying 5.0 properties.
+    MqttWillNotInVersion
+    // A username or password on a 3.1.1 CONNECT with no username: the
+    // specification allows a password only where a username is
+    // present.
+    MqttPasswordWithoutUsername
+
+// Options with the defaults, for the given client identifier.
+//
+// MQTT 5.0, a 60-second keep-alive, a clean start, a Receive Maximum
+// of 100, a 256 KiB maximum packet size, no aliases, no will, and
+// `mqttread.default_limits()`.
+//
+// ```novo
+// use mqttopts
+//
+// fn main() [io]
+//     let o = mqttopts.options("sensor-7")
+//     println("${o.keep_alive_secs}")
+// ```
+pub fn options(client_id: Str) -> MqttOptions []
+    todo("mqtt-nv.mqttopts.options")
+
+// The shape a constrained device takes: MQTT 3.1.1, a 300-second
+// keep-alive, a Receive Maximum of 1, a 2 KiB maximum packet size and
+// `mqttread.embedded_limits()`.
+//
+// The numbers are the ones that change what the program COSTS rather
+// than what it does.  A Receive Maximum of one means at most one
+// unacknowledged publication, so the session holds at most one
+// retained packet; 2 KiB is what a decoder can be given on a part with
+// 64 KiB of RAM; and 3.1.1 is chosen because 5.0's property sections
+// are the part of the protocol that allocates.
+//
+// This is a profile, not a tier claim.  The package is `host` and does
+// not build at `@tier(embedded)`; what a device runs is mqtt-codec-nv
+// plus a `MqttTransport[e]` over the board's own socket, and the
+// README says exactly what that costs.
+//
+// ```novo
+// use mqttopts
+//
+// fn main() [io]
+//     let o = mqttopts.rt_profile("node-3")
+//     println("${o.receive_maximum}")
+// ```
+pub fn rt_profile(client_id: Str) -> MqttOptions []
+    todo("mqtt-nv.mqttopts.rt_profile")
+
+// Options with every limit set to what the protocol allows, for the
+// caller who has read the paragraph above and means it.
+//
+// ```novo
+// use mqttopts
+//
+// fn main() [io]
+//     let o = mqttopts.unlimited("bridge")
+//     println("${o.receive_maximum}")
+// ```
+pub fn unlimited(client_id: Str) -> MqttOptions []
+    todo("mqtt-nv.mqttopts.unlimited")
+
+// The protocol version.
+//
+// ```novo
+// use mqttopts
+//
+// fn main() [io]
+//     let o = mqttopts.with_version(mqttopts.options("c"), Mqtt311)
+//     println("${o.clean_start}")
+// ```
+pub fn with_version(o: MqttOptions, v: MqttVersion) -> MqttOptions []
+    todo("mqtt-nv.mqttopts.with_version")
+
+// The keep-alive interval, in seconds.
+//
+// ```novo
+// use mqttopts
+//
+// fn main() [io]
+//     let o = mqttopts.with_keep_alive(mqttopts.options("c"), 30)
+//     println("${o.keep_alive_secs}")
+// ```
+pub fn with_keep_alive(o: MqttOptions, secs: Int) -> MqttOptions []
+    todo("mqtt-nv.mqttopts.with_keep_alive")
+
+// Whether to start clean, and how long the broker keeps the session
+// once the socket goes.
+//
+// The two travel together because they are one decision: a session
+// expiry on a clean start expires a session that was never made.
+//
+// ```novo
+// use mqttopts
+//
+// fn main() [io]
+//     let o = mqttopts.with_session(mqttopts.options("c"), false, 3600)
+//     println("${o.session_expiry_secs}")
+// ```
+pub fn with_session(o: MqttOptions, clean_start: Bool, expiry_secs: Int) -> MqttOptions []
+    todo("mqtt-nv.mqttopts.with_session")
+
+// A username and password.
+//
+// ```novo
+// use mqttopts
+//
+// fn main() [io]
+//     let c = MqttCredentials { username: "sensor", password: [] }
+//     let o = mqttopts.with_credentials(mqttopts.options("c"), c)
+//     println("${o.client_id}")
+// ```
+pub fn with_credentials(o: MqttOptions, c: MqttCredentials) -> MqttOptions []
+    todo("mqtt-nv.mqttopts.with_credentials")
+
+// The last will, as mqtt-codec-nv spells it.
+//
+// ```novo
+// use mqttopts
+//
+// fn main() [io]
+//     let o = mqttopts.options("c")
+//     println("${o.client_id}")
+// ```
+pub fn with_will(o: MqttOptions, w: MqttWill) -> MqttOptions []
+    todo("mqtt-nv.mqttopts.with_will")
+
+// The flow-control and size limits this client announces.
+//
+// ```novo
+// use mqttopts
+//
+// fn main() [io]
+//     let o = mqttopts.with_limits(mqttopts.options("c"), 20, 65536, 10)
+//     println("${o.max_packet_size}")
+// ```
+pub fn with_limits(o: MqttOptions, receive_maximum: Int, max_packet_size: Int,
+                   topic_alias_maximum: Int) -> MqttOptions []
+    todo("mqtt-nv.mqttopts.with_limits")
+
+// The decoder's limits.
+//
+// ```novo
+// use mqttopts
+// use mqttread
+//
+// fn main() [io]
+//     let o = mqttopts.with_decode_limits(mqttopts.options("c"),
+//                                         mqttread.embedded_limits())
+//     println("${o.client_id}")
+// ```
+pub fn with_decode_limits(o: MqttOptions, l: MqttLimits) -> MqttOptions []
+    todo("mqtt-nv.mqttopts.with_decode_limits")
+
+// The three timings the broker never sees.
+//
+// ```novo
+// use mqttopts
+//
+// fn main() [io]
+//     let o = mqttopts.with_timeouts(mqttopts.options("c"), 5000, 10000, 0)
+//     println("${o.ping_timeout_ms}")
+// ```
+pub fn with_timeouts(o: MqttOptions, connack_ms: Int, ping_ms: Int,
+                     resend_after_ms: Int) -> MqttOptions []
+    todo("mqtt-nv.mqttopts.with_timeouts")
+
+// Every reason these options cannot be used, in the order a reader
+// would want to fix them.
+//
+// A list rather than the first fault, because a set of options is
+// written once and a caller correcting them one round trip at a time
+// is a caller who stops reading.
+//
+// ```novo
+// use mqttopts
+// use std.list
+//
+// fn main() [io]
+//     let n = list.len(mqttopts.faults(mqttopts.options("c")))
+//     println("${n}")
+// ```
+pub fn faults(o: MqttOptions) -> [MqttOptionsFault] []
+    todo("mqtt-nv.mqttopts.faults")
+
+// The CONNECT these options describe.
+//
+// This is the whole of what the options mean: everything else in this
+// module is a way of filling the struct this function reads.  A test
+// that asserts the packet has asserted the configuration.
+//
+// ```novo
+// use mqttopts
+//
+// fn main() [io]
+//     match mqttopts.connect_packet(mqttopts.options("sensor-7"))
+//         Ok(c)  => println(c.client_id)
+//         Err(_) => println("refused")
+// ```
+pub fn connect_packet(o: MqttOptions) -> Result<MqttConnect, MqttEncodeError> []
+    todo("mqtt-nv.mqttopts.connect_packet")
+
+// The keep-alive interval in milliseconds, which is what the client
+// and every timing in this package actually count in.
+//
+// ```novo
+// use mqttopts
+//
+// fn main() [io]
+//     let n = mqttopts.keep_alive_ms(mqttopts.options("c"))
+//     println("${n}")
+// ```
+pub fn keep_alive_ms(o: MqttOptions) -> Int []
+    todo("mqtt-nv.mqttopts.keep_alive_ms")
