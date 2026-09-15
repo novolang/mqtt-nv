@@ -5,6 +5,10 @@ All notable changes to mqtt-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.0.2 — 2026-09-15
+
+README rewritten to the package README style guide (docs/writing-a-readme.md); no change to the interface.
+
 ## 0.0.1 — 2026-09-11
 
 The **interface**: every signature and every effect row, and no bodies.
@@ -64,3 +68,24 @@ The **interface**: every signature and every effect row, and no bodies.
   `mqttopts.rt_profile`'s numbers; the README says what is still
   missing before that is real.
 - **One `core` dependency**, mqtt-codec-nv, itself an interface today.
+
+### Design notes
+
+The client is ported from `rumqttc`, with `paho.mqtt` as the second
+reading.  Three shapes come across unchanged: `MqttOptions` as a
+builder, the split between a client value and a loop the caller turns,
+and requests and events as the two directions of one conversation.
+Three change.  `rumqttc`'s `EventLoop` owns a `tokio` task and a
+channel; here the caller owns the loop, because a `host` package that
+brought an async runtime with it would be choosing one for every
+program that depends on it.  Its transport is an enum of the
+connections it knows about; here it is a trait, so a caller's own
+transport is an ordinary case rather than a patch.  And its `Duration`s
+become millisecond integers taken as arguments, which is what makes the
+timing assertable against a table and lets the same functions run where
+`std.time` does not exist.
+
+A device consumer takes the trait and `mqttopts.rt_profile`'s numbers
+from this package, mqtt-codec-nv for the packets, and writes its own
+transport over the board's socket.  It does not take this package,
+which is `host` and does not build into firmware.
