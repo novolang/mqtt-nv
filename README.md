@@ -136,7 +136,7 @@ specification the implementation will have to satisfy.
 
 | Module | Contents |
 | --- | --- |
-| `mqtttrans` | The transport: a trait of four methods over a byte pipe, and two implementations of it, one over TCP and one over TLS. |
+| `mqtttrans` | The transport: a trait of four methods over a byte pipe, and two implementations of it, one over TCP and one over TLS with its options record. |
 | `mqttopts` | Everything decided before a socket exists: the CONNECT's fields, three sets of defaults, and the reasons a set of options cannot be used. |
 | `mqttclient` | The client value, the five states a connection can be in, the eight events a turn can report, and the calls that drive it. |
 | `mqttsession` | The state that outlives a socket: unacknowledged publications, received QoS 2 identifiers, subscriptions, packet identifiers and both topic alias tables. |
@@ -293,9 +293,13 @@ on any.
   [websocket-codec-nv](https://novo-lang.org/packages/websocket-codec-nv).
   MQTT over WebSocket is a transport this package does not ship, and
   that pair is what one would be written over.
-- `std.net` and `std.tls` in the standard library are what `MqttTcp` and
-  `MqttTls` are written against. `std.time` is where `now_ms` reads its
-  clock, and it is the only place this package touches it.
+- `std.net` in the standard library is what `MqttTcp` is written
+  against. `MqttTls` is written against a TLS connection handle, and the
+  options beside it are `mqtttrans.MqttTlsConfig` — this package's own
+  record, because the standard library's TLS surface is not published
+  (there is no `docs/stdlib/tls.md` and no module a `use` resolves), so
+  no package can name a type from it. `std.time` is where `now_ms` reads
+  its clock, and it is the only place this package touches it.
 
 ## Tests
 

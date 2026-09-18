@@ -7,7 +7,20 @@ with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
 ## 0.0.2 — 2026-09-15
 
-README rewritten to the package README style guide (docs/writing-a-readme.md); no change to the interface.
+README rewritten to the package README style guide (docs/writing-a-readme.md).
+
+### Changed
+
+- **`mqtttrans.dial_tls` and `.tls_for` name `MqttTlsConfig`**, a struct
+  this package declares, where 0.0.1 named a bare `TlsConfig`.  No such
+  type exists in any build: the standard library's TLS surface is not
+  published, and the name type-checked in 0.0.1 only because the
+  undefined-type check (`E2033`) had not landed.  The fields are the
+  ones the two functions always meant — `hostname` for SNI and the
+  certificate name match, `verify_peer`, and `ca_bundle_path`, which is
+  the field a broker behind a private certificate authority needs.  A
+  0.0.1 consumer could not have called either function, so nothing that
+  compiled before stops.
 
 ## 0.0.1 — 2026-09-11
 

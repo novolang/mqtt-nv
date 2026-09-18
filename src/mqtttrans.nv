@@ -64,14 +64,41 @@ pub trait MqttTransport[e]
 pub struct MqttTcp
     stream: TcpStream
 
-// MQTT over TLS, through the standard library's connection handles.
+// MQTT over TLS.
 //
-// The handle is an `Int` because that is what `std.tls` answers; the
+// The handle is an `Int` because a TLS session is opaque here; the
 // hostname is kept beside it so a reconnection can verify the same
 // name without the caller having to remember which one it used.
 pub struct MqttTls
     conn: Int
     hostname: Str
+
+// The TLS options `dial_tls` opens a connection with.
+//
+// THE PACKAGE DECLARES IT rather than naming a standard library type.
+// `compiler/stdlib/tls.nv` holds a struct of this shape, but it is not
+// a published surface: there is no `docs/stdlib/tls.md`, no `use`
+// brings the module into scope, and a signature naming its type
+// type-checked only while the undefined-type check did not exist.  It
+// does now, and it is `E2033`.
+//
+// AND THE NAME IS PREFIXED because struct identity is keyed by NAME
+// across a whole assembly, dependencies included: two packages that
+// each declared a bare `TlsConfig` could not be used by the same
+// program.  docs/publishing.md, "Public type names are globally
+// unique".
+//
+// `hostname` is both the SNI sent and the name the broker's
+// certificate is matched against — one field, because a program that
+// could set them apart would have a way to verify the wrong name.  An
+// empty `ca_bundle_path` means the platform's trust store, which is
+// the wrong answer on a device that has none: a broker with a private
+// certificate authority is the ordinary MQTT deployment, and that is
+// the field it sets.
+pub struct MqttTlsConfig
+    hostname: Str
+    verify_peer: Bool
+    ca_bundle_path: Str
 
 // The default MQTT port, 1883.
 pub const MQTT_PORT = 1883
@@ -122,7 +149,7 @@ pub fn dial_tcp_timeout(host: Str, port: Int,
 // fn main() [io]
 //     println("${mqtttrans.MQTT_TLS_PORT}")
 // ```
-pub fn dial_tls(host: Str, port: Int, cfg: TlsConfig) -> Result<MqttTls, IoError> [net]
+pub fn dial_tls(host: Str, port: Int, cfg: MqttTlsConfig) -> Result<MqttTls, IoError> [net]
     todo("mqtt-nv.mqtttrans.dial_tls")
 
 // A client-side TLS configuration for a broker hostname, with peer
@@ -138,7 +165,7 @@ pub fn dial_tls(host: Str, port: Int, cfg: TlsConfig) -> Result<MqttTls, IoError
 //     let cfg = mqtttrans.tls_for("broker.example.com")
 //     println("${mqtttrans.MQTT_TLS_PORT}")
 // ```
-pub fn tls_for(hostname: Str) -> TlsConfig []
+pub fn tls_for(hostname: Str) -> MqttTlsConfig []
     todo("mqtt-nv.mqtttrans.tls_for")
 
 // The TcpStream inside, for a caller that has to set a socket option
