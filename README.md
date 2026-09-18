@@ -136,7 +136,7 @@ specification the implementation will have to satisfy.
 
 | Module | Contents |
 | --- | --- |
-| `mqtttrans` | The transport: a trait of four methods over a byte pipe, and two implementations of it, one over TCP and one over TLS with its options record. |
+| `mqtttrans` | The transport: a trait of four methods over a byte pipe, and two implementations of it, one over TCP and one over TLS with the standard library's `TlsConfig`. |
 | `mqttopts` | Everything decided before a socket exists: the CONNECT's fields, three sets of defaults, and the reasons a set of options cannot be used. |
 | `mqttclient` | The client value, the five states a connection can be in, the eight events a turn can report, and the calls that drive it. |
 | `mqttsession` | The state that outlives a socket: unacknowledged publications, received QoS 2 identifiers, subscriptions, packet identifiers and both topic alias tables. |
@@ -295,11 +295,12 @@ on any.
   that pair is what one would be written over.
 - `std.net` in the standard library is what `MqttTcp` is written
   against. `MqttTls` is written against a TLS connection handle, and the
-  options beside it are `mqtttrans.MqttTlsConfig` — this package's own
-  record, because the standard library's TLS surface is not published
-  (there is no `docs/stdlib/tls.md` and no module a `use` resolves), so
-  no package can name a type from it. `std.time` is where `now_ms` reads
-  its clock, and it is the only place this package touches it.
+  options beside it are `std.tls`'s own `TlsConfig`, named bare after
+  `use std.tls`. This package declared a `MqttTlsConfig` of its own in
+  0.0.2, when `std.tls` had no page and no `use` that resolved; 0.0.3
+  drops it for the standard library's record, which carries every field
+  it had. `std.time` is where `now_ms` reads its clock, and it is the
+  only place this package touches it.
 
 ## Tests
 

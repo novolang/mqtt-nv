@@ -1,6 +1,6 @@
 [package]
 name        = "mqtt-nv"
-version     = "0.0.2"
+version     = "0.0.3"
 description = "The socket half of MQTT, over mqtt-codec-nv: a client value the host drives from its own loop — connect with the options, subscribe and unsubscribe, publish at QoS 0, 1 and 2 with the retransmission state machine, keep-alive and ping, the session as a value the host stores, a reconnection policy and the last will.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 
@@ -34,7 +34,12 @@ category    = "networking"
 tags        = ["mqtt", "mqtt5", "mqtt311", "client", "pubsub", "iot", "keep-alive", "qos"]
 repository  = "https://github.com/novolang/mqtt-nv"
 maintainers = ["novo-lang"]
-novo        = ">= 0.8.9"
+# `>= 0.9.1` and not `>= 0.8.9`: `mqtttrans` names `TlsConfig`, the
+# standard library's record, which no toolchain before 0.9.1 has a
+# reachable module for.  `std.tls` existed in 0.9.0 and could not be
+# named — no `use` resolved it — which is the whole reason 0.0.2
+# carried a `MqttTlsConfig` of its own.
+novo        = ">= 0.9.1"
 
 # A library: no `main`, so `novo pkg build` type-checks and
 # effect-checks every module under `src/` and writes no binary.

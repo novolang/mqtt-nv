@@ -37,6 +37,8 @@
 // that parses is a second decoder that eventually disagrees with the
 // first.
 
+use std.tls
+
 // A byte pipe an MQTT client can be driven over.
 //
 // `e` is the effect row the implementation supplies, and it is what a
@@ -72,33 +74,6 @@ pub struct MqttTcp
 pub struct MqttTls
     conn: Int
     hostname: Str
-
-// The TLS options `dial_tls` opens a connection with.
-//
-// THE PACKAGE DECLARES IT rather than naming a standard library type.
-// `compiler/stdlib/tls.nv` holds a struct of this shape, but it is not
-// a published surface: there is no `docs/stdlib/tls.md`, no `use`
-// brings the module into scope, and a signature naming its type
-// type-checked only while the undefined-type check did not exist.  It
-// does now, and it is `E2033`.
-//
-// AND THE NAME IS PREFIXED because struct identity is keyed by NAME
-// across a whole assembly, dependencies included: two packages that
-// each declared a bare `TlsConfig` could not be used by the same
-// program.  docs/publishing.md, "Public type names are globally
-// unique".
-//
-// `hostname` is both the SNI sent and the name the broker's
-// certificate is matched against — one field, because a program that
-// could set them apart would have a way to verify the wrong name.  An
-// empty `ca_bundle_path` means the platform's trust store, which is
-// the wrong answer on a device that has none: a broker with a private
-// certificate authority is the ordinary MQTT deployment, and that is
-// the field it sets.
-pub struct MqttTlsConfig
-    hostname: Str
-    verify_peer: Bool
-    ca_bundle_path: Str
 
 // The default MQTT port, 1883.
 pub const MQTT_PORT = 1883
@@ -143,20 +118,35 @@ pub fn dial_tcp_timeout(host: Str, port: Int,
 // declares, and a caller in a sandbox that grants `[net]` and refuses
 // `[io]` can run this and not `dial_tcp`.
 //
+// THE OPTIONS ARE THE STANDARD LIBRARY'S `TlsConfig`, named bare after
+// `use std.tls` — not a record this package declares.  `hostname` is
+// both the SNI sent and the name the broker's certificate is matched
+// against, one field, because a program that could set them apart
+// would have a way to verify the wrong name.  An empty
+// `ca_bundle_path` means the platform's trust store, which is the
+// wrong answer on a device that has none: a broker behind a private
+// certificate authority is the ordinary MQTT deployment, and that is
+// the field it sets.  `cert_path` and `key_path` are the server half
+// and a client dial leaves them empty.
+//
 // ```novo
 // use mqtttrans
 //
 // fn main() [io]
 //     println("${mqtttrans.MQTT_TLS_PORT}")
 // ```
-pub fn dial_tls(host: Str, port: Int, cfg: MqttTlsConfig) -> Result<MqttTls, IoError> [net]
+pub fn dial_tls(host: Str, port: Int, cfg: TlsConfig) -> Result<MqttTls, IoError> [net]
     todo("mqtt-nv.mqtttrans.dial_tls")
 
 // A client-side TLS configuration for a broker hostname, with peer
 // verification on.
 //
-// One line, and it exists so that the ordinary secure case does not
-// require a caller to have read `std.tls` first.
+// It is `tls.config_for_client(hostname)` and nothing else — the same
+// struct, the same three defaults — kept so the ordinary secure case
+// reads in one `use`: a caller that only dials does not have to have
+// read `std.tls` first.  A caller that wants a private certificate
+// authority sets `ca_bundle_path` on the answer, or builds the
+// `TlsConfig` field by field.
 //
 // ```novo
 // use mqtttrans
@@ -165,7 +155,7 @@ pub fn dial_tls(host: Str, port: Int, cfg: MqttTlsConfig) -> Result<MqttTls, IoE
 //     let cfg = mqtttrans.tls_for("broker.example.com")
 //     println("${mqtttrans.MQTT_TLS_PORT}")
 // ```
-pub fn tls_for(hostname: Str) -> MqttTlsConfig []
+pub fn tls_for(hostname: Str) -> TlsConfig []
     todo("mqtt-nv.mqtttrans.tls_for")
 
 // The TcpStream inside, for a caller that has to set a socket option

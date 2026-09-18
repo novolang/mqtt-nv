@@ -5,6 +5,33 @@ All notable changes to mqtt-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.0.3 — 2026-09-18
+
+### Changed
+
+- **`mqtttrans.dial_tls` and `.tls_for` name `TlsConfig`**, the standard
+  library's own record, and `MqttTlsConfig` is gone.  `std.tls` became
+  reachable from user source on 2026-09-18: `use std.tls` resolves, the
+  surface is spelled `tls.*`, and `docs/stdlib/tls.md` is its page.  The
+  reason this package declared its own record — no `use` brought the
+  module into scope, so no signature could name its type — no longer
+  holds, and the globally-unique type rule prefers one record over a
+  prefixed clone per package.
+- **Nothing was dropped.**  `MqttTlsConfig`'s three fields — `hostname`,
+  `verify_peer`, `ca_bundle_path` — are three of `TlsConfig`'s five,
+  field for field.  The other two, `cert_path` and `key_path`, are the
+  server side's PEM paths, which a client dial leaves empty.
+- **`tls_for` stays and is now exactly `tls.config_for_client`.**  It is
+  kept so a caller that only dials needs one `use`, not two.
+
+### Requires
+
+- **`novo = ">= 0.9.1"`**, up from `>= 0.8.9`.  The package names
+  `TlsConfig`, which the 0.9.0 toolchain has no module for: `std.tls`
+  ships as a reachable module in 0.9.1.  A 0.9.0 build of this release
+  fails on the undefined type, so the floor states it rather than
+  letting it be discovered at `E2033`.
+
 ## 0.0.2 — 2026-09-15
 
 README rewritten to the package README style guide (docs/writing-a-readme.md).
