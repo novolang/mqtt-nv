@@ -42,7 +42,7 @@ impl MqttTransport[] for MqttScript
 
     fn mqtt_recv(self, max: Int) -> Result<Bytes, IoError>
         if self.open
-            Ok(self.incoming)
+            Ok(bytes.clone(self.incoming))
         else
             Ok(bytes.from_str(""))
 
