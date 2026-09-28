@@ -1,6 +1,6 @@
 [package]
 name        = "mqtt-nv"
-version     = "0.0.3"
+version     = "0.0.4"
 description = "The socket half of MQTT, over mqtt-codec-nv: a client value the host drives from its own loop — connect with the options, subscribe and unsubscribe, publish at QoS 0, 1 and 2 with the retransmission state machine, keep-alive and ping, the session as a value the host stores, a reconnection policy and the last will.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 
@@ -62,4 +62,4 @@ novo        = ">= 0.9.1"
 # `stability = "draft"`, every body a `todo()` — so a program that
 # assembles this closure builds and panics on the first packet.  That
 # is the interfaces-first milestone working as designed.
-mqtt-codec-nv = "^0.0.2"
+mqtt-codec-nv = "^0.1.0"

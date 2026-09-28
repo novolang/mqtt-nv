@@ -3,6 +3,6 @@
 [mqtt-codec-nv]
 source = "registry"
 url = "https://registry.novo-lang.org"
-req = "^0.0.2"
-version = "0.0.2"
-hash = "f1264cc873bbcbfcb6c413ffae017863602a4de52da9a86146d7289c76b20071"
+req = "^0.1.0"
+version = "0.1.0"
+hash = "c24cd1ec4ad4b17347e7502b0046864db8c26ddbdc4d143c35faadc7f646ec48"
